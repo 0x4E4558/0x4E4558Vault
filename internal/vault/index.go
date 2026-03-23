@@ -2,6 +2,7 @@ package vault
 
 import (
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"io"
 	"os"
@@ -12,6 +13,22 @@ import (
 
 	"nexvault/internal/nex"
 )
+
+// indexAAD returns the AAD for the vault index using length-prefixed encoding
+// to prevent collisions when vID contains the separator character.
+func indexAAD(vID string) []byte {
+	prefix := []byte("NEX:index:v1:")
+	suffix := []byte("index.nexi")
+	// Buffer: prefix + 4-byte len(vID) + vID + suffix
+	buf := make([]byte, len(prefix)+4+len(vID)+len(suffix))
+	off := 0
+	off += copy(buf[off:], prefix)
+	binary.LittleEndian.PutUint32(buf[off:], uint32(len(vID)))
+	off += 4
+	off += copy(buf[off:], vID)
+	copy(buf[off:], suffix)
+	return buf
+}
 
 func deriveIndexAEADKey(kIndex []byte) ([]byte, error) {
 	if len(kIndex) != 32 {
@@ -55,7 +72,7 @@ func LoadIndexWithKey(indexPath string, kIndex []byte, vID string) (VaultIndex, 
 
 	nonce := raw[4 : 4+nex.NonceSize]
 	ct := raw[4+nex.NonceSize:]
-	pt, err := aead.Open(nil, nonce, ct, []byte("NEX:index:v1:"+vID+":index.nexi"))
+	pt, err := aead.Open(nil, nonce, ct, indexAAD(vID))
 	if err != nil {
 		return VaultIndex{}, nex.ErrWrongKey
 	}
@@ -91,7 +108,7 @@ func SyncIndexWithKey(indexPath string, kIndex []byte, vID string, idx VaultInde
 	if err := nex.MustReadFull(rand.Reader, nonce); err != nil {
 		return err
 	}
-	ct := aead.Seal(nil, nonce, plain, []byte("NEX:index:v1:"+vID+":index.nexi"))
+	ct := aead.Seal(nil, nonce, plain, indexAAD(vID))
 
 	out := append(nex.HeaderMagic(), append(nonce, ct...)...)
 	return nex.WriteFileAtomic(indexPath, out)

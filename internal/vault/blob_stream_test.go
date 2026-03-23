@@ -14,6 +14,84 @@ func randBytes(n int) []byte {
 	return b
 }
 
+// TestChunkAADV2_NoCollision verifies that vID and relPath values that would
+// produce the same string when joined with ":" are given distinct AADs.
+func TestChunkAADV2_NoCollision(t *testing.T) {
+	// "a:b" + "c" and "a" + "b:c" are identical under naive concatenation
+	// but must produce different AADs under length-prefixed encoding.
+	aad1 := chunkAADV2("a:b", "c", 0, 0)
+	aad2 := chunkAADV2("a", "b:c", 0, 0)
+	if bytes.Equal(aad1, aad2) {
+		t.Fatal("AAD collision: different (vID, relPath) produced identical AAD")
+	}
+}
+
+// TestChunkAADV2_DistinctPerField verifies that all AAD parameters contribute
+// independently to the output.
+func TestChunkAADV2_DistinctPerField(t *testing.T) {
+	base := chunkAADV2("vid", "path/file.txt", 1, 0)
+	cases := []struct {
+		name string
+		aad  []byte
+	}{
+		{"different vID", chunkAADV2("vid2", "path/file.txt", 1, 0)},
+		{"different relPath", chunkAADV2("vid", "path/other.txt", 1, 0)},
+		{"different gen", chunkAADV2("vid", "path/file.txt", 2, 0)},
+		{"different chunkIndex", chunkAADV2("vid", "path/file.txt", 1, 1)},
+	}
+	for _, c := range cases {
+		if bytes.Equal(base, c.aad) {
+			t.Errorf("AAD collision for case %q", c.name)
+		}
+	}
+}
+
+// TestDecrypt_WrongVID verifies that a blob encrypted under one vaultID cannot
+// be decrypted using a different vaultID, even if they share a separator.
+func TestDecrypt_WrongVID(t *testing.T) {
+	kRoot := randBytes(32)
+	gen := uint64(1)
+	relPath := "docs/secret.txt"
+	plain := []byte("sensitive data")
+
+	// Encrypt with vID "a:b"
+	var blob bytes.Buffer
+	_, err := EncryptBlobStreamV2(kRoot, "a:b", relPath, gen, bytes.NewReader(plain), &blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Attempt to decrypt with vID "a" and relPath "b:docs/secret.txt" - must fail.
+	var out bytes.Buffer
+	_, err = DecryptBlobStreamV2(kRoot, "a", "b:"+relPath, gen, bytes.NewReader(blob.Bytes()), &out)
+	if err == nil {
+		t.Fatal("expected decryption failure with wrong vID; AAD collision may be present")
+	}
+}
+
+// TestDecrypt_WrongRelPath verifies that a blob cannot be decrypted using a
+// different relPath, even one that would match under naive string concatenation.
+func TestDecrypt_WrongRelPath(t *testing.T) {
+	kRoot := randBytes(32)
+	gen := uint64(1)
+	vID := "vid-test"
+	plain := []byte("other sensitive data")
+
+	// Encrypt with relPath "a:b"
+	var blob bytes.Buffer
+	_, err := EncryptBlobStreamV2(kRoot, vID, "a:b", gen, bytes.NewReader(plain), &blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Attempt to decrypt with a different split - must fail.
+	var out bytes.Buffer
+	_, err = DecryptBlobStreamV2(kRoot, vID+":", "b", gen, bytes.NewReader(blob.Bytes()), &out)
+	if err == nil {
+		t.Fatal("expected decryption failure with wrong relPath; AAD collision may be present")
+	}
+}
+
 func TestEncryptDecrypt_RoundTrip_Sizes(t *testing.T) {
 	kRoot := randBytes(32)
 	vID := "vid-test"

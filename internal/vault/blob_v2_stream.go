@@ -30,11 +30,24 @@ func derivePerBlobKeyV2(kRoot []byte, salt []byte) ([]byte, error) {
 }
 
 func chunkAADV2(vID, relPath string, gen uint64, chunkIndex uint64) []byte {
-	aad := []byte("NEX:blob:v2:" + vID + ":" + relPath + ":")
-	b := make([]byte, 16)
-	binary.LittleEndian.PutUint64(b[0:8], gen)
-	binary.LittleEndian.PutUint64(b[8:16], chunkIndex)
-	return append(aad, b...)
+	prefix := []byte("NEX:blob:v2:")
+	// Length-prefix vID and relPath to prevent AAD collisions when either
+	// field contains the separator character.
+	// Buffer: prefix + 4-byte len(vID) + vID + 4-byte len(relPath) + relPath +
+	//         8-byte gen (uint64) + 8-byte chunkIndex (uint64)
+	buf := make([]byte, len(prefix)+4+len(vID)+4+len(relPath)+16)
+	off := 0
+	off += copy(buf[off:], prefix)
+	binary.LittleEndian.PutUint32(buf[off:], uint32(len(vID)))
+	off += 4
+	off += copy(buf[off:], vID)
+	binary.LittleEndian.PutUint32(buf[off:], uint32(len(relPath)))
+	off += 4
+	off += copy(buf[off:], relPath)
+	binary.LittleEndian.PutUint64(buf[off:], gen)
+	off += 8
+	binary.LittleEndian.PutUint64(buf[off:], chunkIndex)
+	return buf
 }
 
 func nonceForChunk(base []byte, chunkIndex uint64) []byte {
