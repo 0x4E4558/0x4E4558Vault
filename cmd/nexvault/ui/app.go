@@ -611,10 +611,18 @@ func (va *vaultApp) refreshEntries() {
 	va.mu.Lock()
 	va.entries = sorted
 	va.selected = -1
-	va.selectedRows = make(map[int]bool)
 	va.mu.Unlock()
 
+	// Clear the checkbox selection on the UI goroutine so that it is
+	// serialised with doSelectAll(), which also runs on the UI goroutine.
+	// Moving the clear into fyne.Do eliminates the race where the goroutine
+	// cleared selectedRows between doSelectAll's mutex unlock and its
+	// table.Refresh() call, causing the button to say "Deselect All" while
+	// the table rendered with an empty selection map.
 	fyne.Do(func() {
+		va.mu.Lock()
+		va.selectedRows = make(map[int]bool)
+		va.mu.Unlock()
 		va.table.Refresh()
 		va.decryptBtn.Disable()
 		va.deleteBtn.Disable()
@@ -735,6 +743,7 @@ func (va *vaultApp) doDelete() {
 
 // doSelectAll selects all entries when some or none are selected, or clears the
 // selection when every entry is already checked.
+// Must be called from the Fyne event goroutine (button OnTapped callback).
 func (va *vaultApp) doSelectAll() {
 	va.mu.Lock()
 	total := len(va.entries)
@@ -747,23 +756,21 @@ func (va *vaultApp) doSelectAll() {
 		}
 	}
 	count := len(va.selectedRows)
+	sel := va.selected
 	va.mu.Unlock()
 
-	fyne.Do(func() {
-		va.table.Refresh()
-		if count > 0 {
-			va.deleteBtn.Enable()
-			va.selectAllBtn.SetText("Deselect All")
-		} else {
-			va.selectAllBtn.SetText("Select All")
-			va.mu.Lock()
-			sel := va.selected
-			va.mu.Unlock()
-			if sel < 0 {
-				va.deleteBtn.Disable()
-			}
+	// Called from the Fyne button callback — already on the UI goroutine.
+	// Update the table and controls directly; no fyne.Do() needed here.
+	va.table.Refresh()
+	if count > 0 {
+		va.deleteBtn.Enable()
+		va.selectAllBtn.SetText("Deselect All")
+	} else {
+		va.selectAllBtn.SetText("Select All")
+		if sel < 0 {
+			va.deleteBtn.Disable()
 		}
-	})
+	}
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
