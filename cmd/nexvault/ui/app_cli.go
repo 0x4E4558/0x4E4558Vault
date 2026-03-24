@@ -1,3 +1,5 @@
+//go:build !darwin
+
 package ui
 
 import (
@@ -308,4 +310,3 @@ func requireFlag(cmd, flagName, val string) {
 		os.Exit(1)
 	}
 }
-
