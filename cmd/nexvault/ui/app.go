@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -68,6 +69,11 @@ type vaultApp struct {
 	w         *watcher.Watcher
 	entries   []vault.IndexEntry
 	selected  int // row index; -1 = nothing selected
+
+	// statusPending guards against flooding the Fyne event queue with
+	// redundant status-label updates (e.g. during bulk encryption of many
+	// files). At most one updateStatus closure is queued at a time.
+	statusPending atomic.Bool
 
 	// UI elements that are updated reactively
 	statusLabel *widget.Label
@@ -386,10 +392,9 @@ func (va *vaultApp) startSession(vaultDir, dropDir, pass string) {
 	}
 
 	logFn := func(msg string) {
-		// Show a brief notification label update; full notifications require
-		// OS-level entitlements that vary per platform.
-		va.mu.Lock()
-		va.mu.Unlock()
+		// Coalesced status update: at most one fyne.Do closure is ever
+		// queued regardless of how many files are encrypted in quick
+		// succession (e.g. bulk-importing 40 000 items).
 		va.updateStatus()
 	}
 
@@ -439,29 +444,45 @@ func (va *vaultApp) doLock() {
 }
 
 // setLocked adjusts which toolbar buttons are enabled.
-// Must be called from the main goroutine (or via a fyne.Do-equivalent).
+// Safe to call from any goroutine.
 func (va *vaultApp) setLocked(locked bool) {
-	if locked {
-		va.lockBtn.Disable()
-		va.decryptBtn.Disable()
-		va.deleteBtn.Disable()
-	} else {
-		va.lockBtn.Enable()
-	}
+	fyne.Do(func() {
+		if locked {
+			va.lockBtn.Disable()
+			va.decryptBtn.Disable()
+			va.deleteBtn.Disable()
+		} else {
+			va.lockBtn.Enable()
+		}
+	})
 }
 
 func (va *vaultApp) updateStatus() {
-	va.mu.Lock()
-	sess := va.session
-	vp := va.vaultPath
-	dp := va.dropPath
-	va.mu.Unlock()
-
-	if sess == nil || !sess.Active {
-		va.statusLabel.SetText("Status: locked — open or create a vault to begin")
+	// Only queue one fyne.Do closure at a time. If an update is already
+	// pending we skip the queue — the in-flight closure will read the
+	// latest state when it actually runs on the Fyne goroutine.
+	if !va.statusPending.CompareAndSwap(false, true) {
 		return
 	}
-	va.statusLabel.SetText(fmt.Sprintf("Status: unlocked  •  Vault: %s  •  Watching: %s", vp, dp))
+	fyne.Do(func() {
+		va.mu.Lock()
+		sess := va.session
+		vp := va.vaultPath
+		dp := va.dropPath
+		va.mu.Unlock()
+
+		var text string
+		if sess == nil || !sess.Active {
+			text = "Status: locked — open or create a vault to begin"
+		} else {
+			text = fmt.Sprintf("Status: unlocked  •  Vault: %s  •  Watching: %s", vp, dp)
+		}
+		va.statusLabel.SetText(text)
+		// Clear the flag only after the widget update is complete so that
+		// no new closure can be queued during the window between reading
+		// state and applying it to the label.
+		va.statusPending.Store(false)
+	})
 }
 
 // ── Entry table ───────────────────────────────────────────────────────────────
@@ -491,9 +512,11 @@ func (va *vaultApp) refreshEntries() {
 	va.selected = -1
 	va.mu.Unlock()
 
-	va.table.Refresh()
-	va.decryptBtn.Disable()
-	va.deleteBtn.Disable()
+	fyne.Do(func() {
+		va.table.Refresh()
+		va.decryptBtn.Disable()
+		va.deleteBtn.Disable()
+	})
 }
 
 func (va *vaultApp) doRefresh() {
