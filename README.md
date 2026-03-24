@@ -216,4 +216,4 @@ lower-end hardware.
 
 ## License
 
-Proprietary software. All rights reserved.
+See License File.
