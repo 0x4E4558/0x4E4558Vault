@@ -219,7 +219,7 @@ func (w *Watcher) encryptFile(path string) {
 
 	rel, err := filepath.Rel(w.dropDir, path)
 	if err != nil {
-		w.log(fmt.Sprintf("[skip] cannot relativise %s: %v", path, err))
+		w.log(fmt.Sprintf("[skip] cannot relativize %s: %v", path, err))
 		return
 	}
 
