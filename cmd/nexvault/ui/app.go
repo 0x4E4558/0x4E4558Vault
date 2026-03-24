@@ -611,10 +611,18 @@ func (va *vaultApp) refreshEntries() {
 	va.mu.Lock()
 	va.entries = sorted
 	va.selected = -1
-	va.selectedRows = make(map[int]bool)
 	va.mu.Unlock()
 
+	// Clear the checkbox selection on the UI goroutine so that it is
+	// serialised with doSelectAll(), which also runs on the UI goroutine.
+	// Moving the clear into fyne.Do eliminates the race where the goroutine
+	// cleared selectedRows between doSelectAll's mutex unlock and its
+	// table.Refresh() call, causing the button to say "Deselect All" while
+	// the table rendered with an empty selection map.
 	fyne.Do(func() {
+		va.mu.Lock()
+		va.selectedRows = make(map[int]bool)
+		va.mu.Unlock()
 		va.table.Refresh()
 		va.decryptBtn.Disable()
 		va.deleteBtn.Disable()
