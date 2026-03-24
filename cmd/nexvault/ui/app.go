@@ -76,6 +76,15 @@ type vaultApp struct {
 	// files). At most one updateStatus closure is queued at a time.
 	statusPending atomic.Bool
 
+	// refreshPending coalesces entry-table refresh requests so that at most
+	// one refreshEntries goroutine is running at a time even when many files
+	// are encrypted in rapid succession.
+	refreshPending atomic.Bool
+
+	// locking prevents re-entrant doLock calls (e.g. toolbar button clicked
+	// while a tray-menu lock is already in progress).
+	locking atomic.Bool
+
 	// UI elements that are updated reactively
 	statusLabel  *widget.Label
 	table        *widget.Table
@@ -130,7 +139,7 @@ func (va *vaultApp) buildWindow() {
 func (va *vaultApp) buildToolbar() *widget.Toolbar {
 	va.createBtn = widget.NewButton("New Vault", func() { va.showCreateDialog() })
 	va.openBtn = widget.NewButton("Open Vault", func() { va.showOpenDialog() })
-	va.lockBtn = widget.NewButton("Lock", func() { va.doLock() })
+	va.lockBtn = widget.NewButton("Lock", func() { go va.doLock() })
 	va.lockBtn.Importance = widget.DangerImportance
 	va.lockBtn.Disable()
 
@@ -293,7 +302,7 @@ func (va *vaultApp) setupTray() {
 			va.win.RequestFocus()
 		}),
 		fyne.NewMenuItemSeparator(),
-		fyne.NewMenuItem("Lock Vault", func() { va.doLock() }),
+		fyne.NewMenuItem("Lock Vault", func() { go va.doLock() }),
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("Quit", func() { va.app.Quit() }),
 	))
@@ -455,6 +464,17 @@ func (va *vaultApp) startSession(vaultDir, dropDir, pass string) {
 		// queued regardless of how many files are encrypted in quick
 		// succession (e.g. bulk-importing 40 000 items).
 		va.updateStatus()
+		// Refresh the entry table so newly-encrypted files appear without
+		// the user having to click the Refresh button manually. The
+		// refreshPending flag coalesces rapid bursts: if a refresh is already
+		// in progress we skip the extra goroutine — the running one will read
+		// the latest index when it completes.
+		if va.refreshPending.CompareAndSwap(false, true) {
+			go func() {
+				defer va.refreshPending.Store(false)
+				va.refreshEntries()
+			}()
+		}
 	}
 
 	w, err := watcher.New(sess, dropDir, logFn)
@@ -480,6 +500,13 @@ func (va *vaultApp) startSession(vaultDir, dropDir, pass string) {
 }
 
 func (va *vaultApp) doLock() {
+	// Prevent re-entrant calls (e.g. button clicked twice, or toolbar button
+	// and tray menu triggered concurrently).
+	if !va.locking.CompareAndSwap(false, true) {
+		return
+	}
+	defer va.locking.Store(false)
+
 	va.mu.Lock()
 	w := va.w
 	sess := va.session
@@ -492,6 +519,17 @@ func (va *vaultApp) doLock() {
 	va.selectedRows = make(map[int]bool)
 	va.mu.Unlock()
 
+	// Disable interactive controls immediately so the user cannot trigger
+	// another lock (or decrypt/delete) while the watcher is still draining.
+	// This must happen before w.Stop() because Stop() blocks until all
+	// pending files have been encrypted.
+	fyne.Do(func() {
+		va.lockBtn.Disable()
+		va.decryptBtn.Disable()
+		va.deleteBtn.Disable()
+		va.selectAllBtn.Disable()
+	})
+
 	if w != nil {
 		w.Stop()
 	}
@@ -499,7 +537,7 @@ func (va *vaultApp) doLock() {
 		sess.LockAndWipe()
 	}
 	va.setLocked(true)
-	va.table.Refresh()
+	fyne.Do(func() { va.table.Refresh() })
 	va.updateStatus()
 }
 
