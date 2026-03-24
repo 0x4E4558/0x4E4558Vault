@@ -182,6 +182,27 @@ func DecryptToWriterByVaultPath(sess *Session, vRel string, w io.Writer) (plainB
 	return DecryptBlobStream(kRoot, vID, e.VaultRelPath, e.Gen, f, w)
 }
 
+// LoadIndexForSession returns the current vault index for the given session.
+// It is safe for concurrent use.
+func LoadIndexForSession(sess *Session) (VaultIndex, error) {
+	return loadIndexLocked(sess)
+}
+
+// UpsertStreamToVault stores the data from r in the vault at vRel. If an entry
+// with that path already exists it is atomically replaced; otherwise a new entry
+// is created. It is safe for concurrent use.
+func UpsertStreamToVault(sess *Session, vRel string, r io.Reader, sizeHint int64) error {
+	vRel, err := nex.NormalizeVaultRelPath(vRel)
+	if err != nil {
+		return err
+	}
+	idx, err := loadIndexLocked(sess)
+	if err != nil {
+		return err
+	}
+	return PutStreamToVault(sess, vRel, r, sizeHint, FindEntry(&idx, vRel) != -1)
+}
+
 func DeleteEntry(sess *Session, vRel string) error {
 	vRel, err := nex.NormalizeVaultRelPath(vRel)
 	if err != nil {
