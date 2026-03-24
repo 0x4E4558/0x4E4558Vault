@@ -1,127 +1,219 @@
-# 0x4E4558vault
+# nexvault
 
-A cryptographic vault application built with Go, providing secure file storage and management through a graphical interface.
+A cross-platform, cryptographic file vault built with Go. All files are
+encrypted with XChaCha20-Poly1305 before hitting disk. nexvault ships as a
+single binary that works as either a graphical app or a traditional
+command-line tool.
+
+---
 
 ## Features
 
-- **Secure Encryption**: Uses XChaCha20-Poly1305 AEAD encryption with HKDF key derivation
-- **Password-Based Authentication**: Argon2id key derivation with configurable parameters
-- **Chunked Storage**: Files are encrypted and stored in 1MiB chunks for efficient handling
-- **GUI Framework**: Built with Fyne v2 (cross-platform support planned)
-- **Atomic Operations**: All file operations are atomic to prevent data corruption
-- **Version Control**: Each file update increments a generation number for tracking
+| Feature | Detail |
+|---|---|
+| **Encryption** | XChaCha20-Poly1305 AEAD, 1 MiB chunks |
+| **Key derivation** | Argon2id (memory-hard) for the vault password; HKDF-SHA256 for sub-keys |
+| **Auto-encrypt** | Drop a file into the watch folder — it is encrypted and securely wiped |
+| **GUI** | Native-looking Fyne window (Metal on macOS, DirectX on Windows, OpenGL on Linux) |
+| **Dock / taskbar** | Proper app icon on macOS Dock, Windows taskbar, and Linux panels |
+| **System tray** | Status icon with Lock / Quit quick-access menu |
+| **CLI** | Full command-line interface for scripting — run any sub-command to skip the GUI |
+| **Atomic writes** | All vault file operations are atomic; no partial data is ever written |
+| **Key wiping** | Sensitive key material is zeroed in memory when the vault is locked |
 
-## Security Design
+---
 
-### Encryption
-- **Algorithm**: XChaCha20-Poly1305 AEAD
-- **Key Derivation**: HKDF-SHA256 for subkey derivation
-- **Password KDF**: Argon2id (memory-hard, resistant to GPU/ASIC attacks)
-- **Nonce Management**: 24-byte nonces with counter-based chunk sequencing
+## Platform support
 
-### Vault Structure
+| OS | Architecture | Rendering backend |
+|---|---|---|
+| **macOS 12 Monterey +** | Apple Silicon (arm64) & Intel (amd64) | Metal |
+| **Windows 10 / 11** | amd64, arm64 | DirectX (ANGLE) |
+| **Linux** | amd64, arm64 | OpenGL / Vulkan |
+
+---
+
+## Vault structure
+
 ```
 vault/
-├── vault.hdr          # Encrypted vault header with KDF parameters
-├── keyslot.nexk       # Encrypted vault master key
+├── vault.hdr          # Vault header: KDF parameters, vault ID
+├── keyslot.nexk       # Encrypted vault master key (VMK)
 ├── index.nexi         # Encrypted file index
-└── .nex/blobs/       # Encrypted file blobs
-    └── xx/            # First two hex digits of blob ID
-        └── {id}.nex   # Individual encrypted file
+└── .nex/blobs/        # Encrypted file blobs
+    └── xx/            # Sharded by first two hex digits of blob ID
+        └── {id}.nex   # Individual encrypted blob (v2 format)
 ```
+
+---
 
 ## Building
 
 ### Prerequisites
-- Go 1.26.1 or later
-- Currently tested on macOS (Linux and Windows support planned)
 
-### Build Commands
+| Platform | Requirements |
+|---|---|
+| macOS | Xcode Command Line Tools (`xcode-select --install`) |
+| Windows | TDM-GCC or MSYS2 (`pacman -S mingw-w64-ucrt-x86_64-gcc`) |
+| Linux | `libgl1-mesa-dev xorg-dev` (or `libwayland-dev` for Wayland) |
+
+All platforms require **Go 1.21 or later** and **CGO_ENABLED=1** (the default).
+
+### macOS (Apple Silicon)
+
 ```bash
-# Build the application
-go build -o nexvault main.go
+# Install Xcode CLT once
+xcode-select --install
 
-# Run tests
-go test ./...
-
-# Build all packages
-go build ./...
+git clone https://github.com/0x4E4558/0x4E4558Vault.git && cd 0x4E4558Vault
+go build -o nexvault .
+open nexvault        # → app launches with a Dock icon
 ```
+
+### Windows 10 / 11
+
+```powershell
+# Install TDM-GCC from https://jmeubank.github.io/tdm-gcc/ then:
+git clone https://github.com/0x4E4558/0x4E4558Vault.git; cd 0x4E4558Vault
+go build -ldflags "-H windowsgui" -o nexvault.exe .
+.\nexvault.exe
+```
+
+The `-H windowsgui` flag hides the console window when double-clicking.
+
+### Linux
+
+```bash
+# Ubuntu / Debian
+sudo apt install libgl1-mesa-dev xorg-dev
+
+git clone https://github.com/0x4E4558/0x4E4558Vault.git && cd 0x4E4558Vault
+go build -o nexvault .
+./nexvault
+```
+
+### Run tests
+
+```bash
+go test ./...
+```
+
+---
 
 ## Usage
 
-### Creating a New Vault
-1. Launch the application
-2. Click "Link Vault Folder" and select a directory
-3. Enter a strong password
-4. Click "Create" to initialize the vault
+### Graphical interface
 
-### Unlocking an Existing Vault
-1. Link to the vault directory
-2. Enter the vault password
-3. Click "Unlock" to access vault operations
+Launch `nexvault` without arguments (or double-click the binary / app bundle):
 
-### Vault Operations
-- **Import New**: Add files to the vault
-- **Replace**: Update existing files with new versions
-- **Import Directory**: Bulk import entire directory structures
-- **Browse Index**: View and manage vault contents
-- **Decrypt**: Export files from the vault
-
-## Configuration
-
-### Default KDF Parameters
-- **Memory**: 256 MiB (configurable up to 512 MiB)
-- **Iterations**: 3 (configurable up to 4)
-- **Parallelism**: Number of CPU cores (max 4)
-
-### File Handling
-- **Chunk Size**: 1 MiB (fixed for performance)
-- **Blob Format**: Version 2 with authenticated encryption
-- **Index Encryption**: Separate AEAD key derived from vault master key
-
-## Development
-
-### Project Structure
 ```
-nexvault/
-├── cmd/
-│   └── nexvault/
-│       ├── main.go              # Application entry point
-│       └── ui/                 # GUI implementation
-├── internal/
-│   ├── crypto/                # Cryptographic operations
-│   ├── nex/                  # Core constants and utilities
-│   └── vault/                # Vault logic and operations
-├── go.mod                    # Go module definition
-└── main.go                   # Build entry point
+┌─────────────────────────────────────────────────────────────────┐
+│  [New Vault]  [Open Vault]  │  [Lock]       [Decrypt…] [Delete] [Refresh]
+├─────────────────────────────────────────────────────────────────┤
+│  Vault Path                      │  Size    │  Added            │
+│  documents/passport.pdf          │  1.4 MB  │  2025-01-15 09:32 │
+│  photos/id_card.jpg              │  640 KB  │  2025-01-15 09:33 │
+├─────────────────────────────────────────────────────────────────┤
+│  Status: unlocked  •  Vault: ~/secure  •  Watching: ~/Desktop/drop
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### Key Components
-- **Vault**: Main vault operations (create, unlock, manage)
-- **Crypto**: Key derivation and encryption utilities
-- **NEX**: Core constants, file I/O, and utilities
-- **UI**: Fyne-based graphical interface
+1. **New Vault** — pick a vault folder, a drop folder, and set a password.
+2. **Open Vault** — pick the existing vault folder, the drop folder to watch,
+   and enter the password.
+3. **Drop folder** — any file placed there is automatically encrypted into the
+   vault and the plaintext is securely overwritten and removed.
+4. **Decrypt…** — select a row, click Decrypt, and choose where to save the
+   plaintext.
+5. **Delete** — select a row and click Delete to permanently remove the entry.
+6. **Lock** — wipes the in-memory keys and stops the watcher.
 
-## Security Considerations
+The window can be closed without quitting — a system-tray icon lets you Lock,
+Show the window, or Quit from anywhere.
 
-- Passwords are never stored in plain text
-- All sensitive memory is wiped when no longer needed
-- File operations use atomic writes to prevent corruption
-- Vault master keys are encrypted with derived keys
-- Each file chunk is individually authenticated
+### Command-line interface
+
+Passing any known sub-command runs the CLI instead of opening the GUI:
+
+```bash
+# Create a new vault
+nexvault create -vault ~/secure
+
+# Watch a drop folder and auto-encrypt every incoming file
+nexvault watch -vault ~/secure -drop ~/Desktop/drop
+
+# List all entries
+nexvault list -vault ~/secure
+
+# Decrypt one entry
+nexvault decrypt -vault ~/secure -entry documents/passport.pdf -out /tmp/passport.pdf
+
+# Delete an entry
+nexvault delete -vault ~/secure -entry documents/passport.pdf
+```
+
+---
+
+## Security design
+
+### Encryption layers
+
+```
+Password ──Argon2id──► KPass
+                         │
+               keyslot.nexk  ──AEAD decrypt──► VMK (vault master key)
+                                                 │
+                               HKDF-SHA256 ──────┤
+                                           KIndex │  KBlobRoot
+                                                  │
+index.nexi ◄── AEAD(KIndex) ──────────────────────┘
+blobs/*.nex ◄── AEAD(KBlobRoot, per-blob sub-key)
+```
+
+### Per-blob format (v2)
+
+Each blob is a sequence of 1 MiB chunks. Every chunk is independently
+authenticated with XChaCha20-Poly1305. The AEAD additional data encodes
+the vault ID, vault-relative path, generation number, and chunk index,
+so a blob cannot be silently substituted for another.
+
+### Key wiping
+
+`Session.LockAndWipe()` zeroes `KIndex` and `KBlobRoot` in memory immediately
+after the vault is locked — either manually or on application exit.
+
+### Atomic writes
+
+All writes to `index.nexi` and blob files go through a write-to-temp +
+fsync + rename sequence so a crash mid-write never leaves the vault in a
+partially-updated state.
+
+---
+
+## Default KDF parameters
+
+| Parameter | Default | Argon2id constraint |
+|---|---|---|
+| Memory | 256 MiB | — |
+| Iterations | 3 | — |
+| Parallelism | min(GOMAXPROCS, 4) | — |
+
+Minimum recommended RAM: **512 MiB**. Allow 2-4 seconds for unlock on
+lower-end hardware.
+
+---
+
+## Dependencies
+
+| Package | Purpose |
+|---|---|
+| [fyne.io/fyne/v2](https://fyne.io/) | Cross-platform GUI (macOS, Windows, Linux) |
+| [golang.org/x/crypto](https://pkg.go.dev/golang.org/x/crypto) | Argon2id, HKDF, XChaCha20-Poly1305 |
+| [github.com/fsnotify/fsnotify](https://github.com/fsnotify/fsnotify) | Cross-platform file-system watcher |
+| [golang.org/x/term](https://pkg.go.dev/golang.org/x/term) | Secure terminal password input (CLI mode) |
+
+---
 
 ## License
 
 Proprietary software. All rights reserved.
-
-## Dependencies
-
-- [fyne.io/fyne/v2](https://fyne.io/) - Cross-platform GUI framework
-- [golang.org/x/crypto](https://golang.org/x/crypto) - Cryptographic primitives
-
-## System Requirements
-
-- **Memory**: Minimum 512 MiB RAM (1 GiB recommended)
-- **Storage**: Space for encrypted files plus overhead
-- **OS**: Currently macOS 10.15+ (Linux and Windows support planned)
