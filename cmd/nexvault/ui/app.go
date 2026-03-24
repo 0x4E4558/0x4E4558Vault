@@ -68,7 +68,8 @@ type vaultApp struct {
 	dropPath  string
 	w         *watcher.Watcher
 	entries   []vault.IndexEntry
-	selected  int // row index; -1 = nothing selected
+	selected  int            // row index for decrypt; -1 = nothing selected
+	selectedRows map[int]bool // rows checked for bulk delete
 
 	// statusPending guards against flooding the Fyne event queue with
 	// redundant status-label updates (e.g. during bulk encryption of many
@@ -76,18 +77,19 @@ type vaultApp struct {
 	statusPending atomic.Bool
 
 	// UI elements that are updated reactively
-	statusLabel *widget.Label
-	table       *widget.Table
-	decryptBtn  *widget.Button
-	deleteBtn   *widget.Button
-	lockBtn     *widget.Button
-	openBtn     *widget.Button
-	createBtn   *widget.Button
+	statusLabel  *widget.Label
+	table        *widget.Table
+	decryptBtn   *widget.Button
+	deleteBtn    *widget.Button
+	lockBtn      *widget.Button
+	openBtn      *widget.Button
+	createBtn    *widget.Button
+	selectAllBtn *widget.Button
 }
 
 func runGUI() {
 	a := app.NewWithID("io.nexvault.app")
-	va := &vaultApp{app: a, selected: -1}
+	va := &vaultApp{app: a, selected: -1, selectedRows: make(map[int]bool)}
 	va.buildWindow()
 	va.setupTray()
 	a.Run()
@@ -134,6 +136,8 @@ func (va *vaultApp) buildToolbar() *widget.Toolbar {
 
 	va.decryptBtn = widget.NewButton("Decrypt…", func() { va.doDecrypt() })
 	va.decryptBtn.Disable()
+	va.selectAllBtn = widget.NewButton("Select All", func() { va.doSelectAll() })
+	va.selectAllBtn.Disable()
 	va.deleteBtn = widget.NewButton("Delete", func() { va.doDelete() })
 	va.deleteBtn.Disable()
 	refreshBtn := widget.NewButton("Refresh", func() { va.doRefresh() })
@@ -145,6 +149,7 @@ func (va *vaultApp) buildToolbar() *widget.Toolbar {
 		&toolbarWidget{va.lockBtn},
 		widget.NewToolbarSpacer(),
 		&toolbarWidget{va.decryptBtn},
+		&toolbarWidget{va.selectAllBtn},
 		&toolbarWidget{va.deleteBtn},
 		widget.NewToolbarSeparator(),
 		&toolbarWidget{refreshBtn},
@@ -157,33 +162,83 @@ type toolbarWidget struct{ btn *widget.Button }
 func (t *toolbarWidget) ToolbarObject() fyne.CanvasObject { return t.btn }
 
 func (va *vaultApp) buildTable() *widget.Table {
-	headers := []string{"Vault Path", "Size", "Added"}
+	headers := []string{"", "Vault Path", "Size", "Added"}
 
 	tbl := widget.NewTableWithHeaders(
 		func() (int, int) {
 			va.mu.Lock()
 			defer va.mu.Unlock()
-			return len(va.entries), 3
+			return len(va.entries), 4
 		},
+		// CreateCell returns a container holding both a checkbox (col 0) and a
+		// label (cols 1-3). UpdateCell shows or hides the appropriate widget.
 		func() fyne.CanvasObject {
-			return widget.NewLabel("")
+			return container.NewStack(
+				widget.NewCheck("", func(bool) {}),
+				widget.NewLabel(""),
+			)
 		},
 		func(id widget.TableCellID, obj fyne.CanvasObject) {
-			l := obj.(*widget.Label)
+			c := obj.(*fyne.Container)
+			chk := c.Objects[0].(*widget.Check)
+			lbl := c.Objects[1].(*widget.Label)
+
 			va.mu.Lock()
-			defer va.mu.Unlock()
 			if id.Row < 0 || id.Row >= len(va.entries) {
-				l.SetText("")
+				va.mu.Unlock()
+				chk.Hide()
+				lbl.SetText("")
+				lbl.Show()
 				return
 			}
 			e := va.entries[id.Row]
+			checked := va.selectedRows[id.Row]
+			va.mu.Unlock()
+
+			if id.Col == 0 {
+				lbl.Hide()
+				chk.Show()
+				row := id.Row
+				// Nil the callback before updating the checked state so that
+				// programmatic updates during cell recycling don't fire it.
+				chk.OnChanged = nil
+				chk.Checked = checked
+				chk.Refresh()
+				chk.OnChanged = func(v bool) {
+					va.mu.Lock()
+					if v {
+						va.selectedRows[row] = true
+					} else {
+						delete(va.selectedRows, row)
+					}
+					count := len(va.selectedRows)
+					total := len(va.entries)
+					sel := va.selected
+					va.mu.Unlock()
+					// OnChanged runs on the Fyne event loop; update UI directly.
+					if count > 0 || sel >= 0 {
+						va.deleteBtn.Enable()
+					} else {
+						va.deleteBtn.Disable()
+					}
+					if count > 0 && count == total {
+						va.selectAllBtn.SetText("Deselect All")
+					} else {
+						va.selectAllBtn.SetText("Select All")
+					}
+				}
+				return
+			}
+
+			chk.Hide()
+			lbl.Show()
 			switch id.Col {
-			case 0:
-				l.SetText(e.VaultRelPath)
 			case 1:
-				l.SetText(guiFormatSize(e.Size))
+				lbl.SetText(e.VaultRelPath)
 			case 2:
-				l.SetText(time.Unix(e.Added, 0).Format("2006-01-02 15:04"))
+				lbl.SetText(guiFormatSize(e.Size))
+			case 3:
+				lbl.SetText(time.Unix(e.Added, 0).Format("2006-01-02 15:04"))
 			}
 		},
 	)
@@ -198,9 +253,10 @@ func (va *vaultApp) buildTable() *widget.Table {
 		}
 	}
 
-	tbl.SetColumnWidth(0, 480)
-	tbl.SetColumnWidth(1, 90)
-	tbl.SetColumnWidth(2, 150)
+	tbl.SetColumnWidth(0, 36)
+	tbl.SetColumnWidth(1, 480)
+	tbl.SetColumnWidth(2, 90)
+	tbl.SetColumnWidth(3, 150)
 
 	tbl.OnSelected = func(id widget.TableCellID) {
 		va.mu.Lock()
@@ -212,9 +268,12 @@ func (va *vaultApp) buildTable() *widget.Table {
 	tbl.OnUnselected = func(_ widget.TableCellID) {
 		va.mu.Lock()
 		va.selected = -1
+		count := len(va.selectedRows)
 		va.mu.Unlock()
 		va.decryptBtn.Disable()
-		va.deleteBtn.Disable()
+		if count == 0 {
+			va.deleteBtn.Disable()
+		}
 	}
 
 	return tbl
@@ -430,6 +489,7 @@ func (va *vaultApp) doLock() {
 	va.dropPath = ""
 	va.entries = nil
 	va.selected = -1
+	va.selectedRows = make(map[int]bool)
 	va.mu.Unlock()
 
 	if w != nil {
@@ -451,8 +511,11 @@ func (va *vaultApp) setLocked(locked bool) {
 			va.lockBtn.Disable()
 			va.decryptBtn.Disable()
 			va.deleteBtn.Disable()
+			va.selectAllBtn.Disable()
+			va.selectAllBtn.SetText("Select All")
 		} else {
 			va.lockBtn.Enable()
+			va.selectAllBtn.Enable()
 		}
 	})
 }
@@ -510,12 +573,14 @@ func (va *vaultApp) refreshEntries() {
 	va.mu.Lock()
 	va.entries = sorted
 	va.selected = -1
+	va.selectedRows = make(map[int]bool)
 	va.mu.Unlock()
 
 	fyne.Do(func() {
 		va.table.Refresh()
 		va.decryptBtn.Disable()
 		va.deleteBtn.Disable()
+		va.selectAllBtn.SetText("Select All")
 	})
 }
 
@@ -564,27 +629,103 @@ func (va *vaultApp) doDelete() {
 	sel := va.selected
 	entries := va.entries
 	sess := va.session
+	// Collect checked rows in sorted order.
+	checkedRows := make([]int, 0, len(va.selectedRows))
+	for r := range va.selectedRows {
+		checkedRows = append(checkedRows, r)
+	}
 	va.mu.Unlock()
 
-	if sel < 0 || sel >= len(entries) || sess == nil {
+	if sess == nil {
 		return
 	}
-	entry := entries[sel]
 
-	dialog.ShowConfirm("Delete Entry",
-		fmt.Sprintf("Permanently delete:\n\n%s\n\nThis cannot be undone.", entry.VaultRelPath),
-		func(ok bool) {
-			if !ok {
-				return
-			}
-			go func() {
-				if err := vault.DeleteEntry(sess, entry.VaultRelPath); err != nil {
-					va.showErrorOnMain("Delete failed", err)
+	// If no checkboxes are ticked, fall back to deleting the single selected row.
+	if len(checkedRows) == 0 {
+		if sel < 0 || sel >= len(entries) {
+			return
+		}
+		entry := entries[sel]
+		dialog.ShowConfirm("Delete Entry",
+			fmt.Sprintf("Permanently delete:\n\n%s\n\nThis cannot be undone.", entry.VaultRelPath),
+			func(ok bool) {
+				if !ok {
 					return
 				}
-				va.refreshEntries()
-			}()
-		}, va.win)
+				go func() {
+					if err := vault.DeleteEntry(sess, entry.VaultRelPath); err != nil {
+						va.showErrorOnMain("Delete failed", err)
+						return
+					}
+					va.refreshEntries()
+				}()
+			}, va.win)
+		return
+	}
+
+	// Multi-delete: gather paths for all checked rows.
+	sort.Ints(checkedRows)
+	paths := make([]string, 0, len(checkedRows))
+	for _, r := range checkedRows {
+		if r >= 0 && r < len(entries) {
+			paths = append(paths, entries[r].VaultRelPath)
+		}
+	}
+	if len(paths) == 0 {
+		return
+	}
+
+	var msg string
+	if len(paths) == 1 {
+		msg = fmt.Sprintf("Permanently delete:\n\n%s\n\nThis cannot be undone.", paths[0])
+	} else {
+		msg = fmt.Sprintf("Permanently delete %d entries?\n\nThis cannot be undone.", len(paths))
+	}
+	dialog.ShowConfirm("Delete Entries", msg, func(ok bool) {
+		if !ok {
+			return
+		}
+		go func() {
+			if err := vault.DeleteEntries(sess, paths); err != nil {
+				va.showErrorOnMain("Delete failed", err)
+				return
+			}
+			va.refreshEntries()
+		}()
+	}, va.win)
+}
+
+// doSelectAll selects all entries when some or none are selected, or clears the
+// selection when every entry is already checked.
+func (va *vaultApp) doSelectAll() {
+	va.mu.Lock()
+	total := len(va.entries)
+	allSelected := len(va.selectedRows) == total && total > 0
+	if allSelected {
+		va.selectedRows = make(map[int]bool)
+	} else {
+		for i := 0; i < total; i++ {
+			va.selectedRows[i] = true
+		}
+	}
+	count := len(va.selectedRows)
+	va.mu.Unlock()
+
+	fyne.Do(func() {
+		va.table.Refresh()
+		if count > 0 {
+			va.deleteBtn.Enable()
+			va.selectAllBtn.SetText("Deselect All")
+		} else {
+			va.selectAllBtn.SetText("Select All")
+			va.mu.Lock()
+			sel := va.selected
+			va.mu.Unlock()
+			if sel < 0 {
+				va.deleteBtn.Disable()
+			}
+		}
+	})
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
