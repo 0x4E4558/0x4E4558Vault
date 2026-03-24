@@ -203,6 +203,62 @@ func UpsertStreamToVault(sess *Session, vRel string, r io.Reader, sizeHint int64
 	return PutStreamToVault(sess, vRel, r, sizeHint, FindEntry(&idx, vRel) != -1)
 }
 
+// DeleteEntries atomically removes multiple vault entries in a single index
+// read/write cycle, making it efficient for bulk deletions. Entries that are
+// not found in the index are silently skipped.
+func DeleteEntries(sess *Session, vRels []string) error {
+	if len(vRels) == 0 {
+		return nil
+	}
+
+	normalized := make([]string, 0, len(vRels))
+	for _, vRel := range vRels {
+		n, err := nex.NormalizeVaultRelPath(vRel)
+		if err != nil {
+			return err
+		}
+		normalized = append(normalized, n)
+	}
+
+	sess.Mutex.RLock()
+	if !sess.Active {
+		sess.Mutex.RUnlock()
+		return errors.New("vault locked")
+	}
+	vPath := sess.VaultPath
+	sess.Mutex.RUnlock()
+
+	idx, err := loadIndexLocked(sess)
+	if err != nil {
+		return err
+	}
+
+	toDelete := make(map[string]struct{}, len(normalized))
+	for _, vRel := range normalized {
+		toDelete[vRel] = struct{}{}
+	}
+
+	var blobsToRemove []string
+	remaining := make([]IndexEntry, 0, len(idx.Entries))
+	for _, e := range idx.Entries {
+		if _, del := toDelete[e.VaultRelPath]; del {
+			blobsToRemove = append(blobsToRemove, e.BlobName)
+		} else {
+			remaining = append(remaining, e)
+		}
+	}
+
+	idx.Entries = remaining
+	if err := syncIndexLocked(sess, idx); err != nil {
+		return err
+	}
+
+	for _, blob := range blobsToRemove {
+		_ = os.Remove(filepath.Join(vPath, filepath.FromSlash(blob)))
+	}
+	return nil
+}
+
 func DeleteEntry(sess *Session, vRel string) error {
 	vRel, err := nex.NormalizeVaultRelPath(vRel)
 	if err != nil {
