@@ -19,6 +19,10 @@ func CreateVault(dir, pass string) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
+	// Best-effort: hide the vault directory from OS file browsers.
+	// On macOS this sets UF_HIDDEN; on Windows FILE_ATTRIBUTE_HIDDEN.
+	// The directory is still fully accessible by its absolute path.
+	_ = HideDirectory(dir)
 
 	salt := make([]byte, nex.VaultSaltSize)
 	vmk := make([]byte, nex.VMKSize)

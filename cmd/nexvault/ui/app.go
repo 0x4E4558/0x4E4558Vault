@@ -1,26 +1,20 @@
 // Package ui is the cross-platform entry point for nexvault.
 //
 // When launched without arguments (double-clicking the binary or app bundle)
-// a Fyne GUI opens with a proper Dock icon on macOS and a taskbar entry on
-// Windows / Linux. When run with a known sub-command (create, watch, list,
-// decrypt, delete) the traditional text-based CLI is used instead, which
-// makes scripting and automation straightforward on all platforms.
+// a Fyne GUI opens. On desktop platforms (macOS, Windows, Linux) a CLI is
+// also available when a sub-command is passed on os.Args; see cli.go.
+// On Android and iOS only the GUI is compiled in.
 package ui
 
 import (
-	"bufio"
-	"errors"
-	"flag"
 	"fmt"
 	"os"
-	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
-	"text/tabwriter"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -30,28 +24,14 @@ import (
 	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
-	"golang.org/x/term"
 
 	"nexvault/internal/vault"
 	"nexvault/internal/watcher"
 )
 
-// ── Entry point ───────────────────────────────────────────────────────────────
-
-// Run is the application entry point.
-// If a known CLI sub-command is present it runs in CLI mode; otherwise the
-// Fyne GUI is launched.
-func Run() {
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "create", "watch", "list", "ls", "decrypt", "get", "delete", "rm",
-			"help", "-h", "--help":
-			runCLI()
-			return
-		}
-	}
-	runGUI()
-}
+// autoLockDuration is the period of inactivity after which an unlocked vault
+// is automatically locked. 1800 seconds = 30 minutes.
+const autoLockDuration = 1800 * time.Second
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║  GUI                                                                     ║
@@ -82,8 +62,20 @@ type vaultApp struct {
 	refreshPending atomic.Bool
 
 	// locking prevents re-entrant doLock calls (e.g. toolbar button clicked
-	// while a tray-menu lock is already in progress).
+	// while a tray-menu lock is already in progress). It also means that the
+	// window close-intercept and tray-Quit paths are safe if triggered rapidly
+	// in succession — only the first call does real work.
 	locking atomic.Bool
+
+	// autoLockTimer fires doLock after autoLockDuration of the vault being
+	// unlocked. It is started in startSession and cancelled in doLock.
+	autoLockTimer *time.Timer
+
+	// sessionGen is incremented each time a new session is started or doLock
+	// runs. The auto-lock timer callback compares its captured generation
+	// against the current value to skip locking if a new session has started
+	// between when the timer fired and when the callback executes.
+	sessionGen uint64
 
 	// UI elements that are updated reactively
 	statusLabel  *widget.Label
@@ -94,6 +86,7 @@ type vaultApp struct {
 	openBtn      *widget.Button
 	createBtn    *widget.Button
 	selectAllBtn *widget.Button
+	importBtn    *widget.Button
 }
 
 func runGUI() {
@@ -101,6 +94,28 @@ func runGUI() {
 	va := &vaultApp{app: a, selected: -1, selectedRows: make(map[int]bool)}
 	va.buildWindow()
 	va.setupTray()
+	// Safety net: if the OS terminates the process while a vault is open,
+	// wipe the in-memory keys before the process exits. This runs after
+	// a.Run() returns (i.e. after Quit() is called).
+	a.Lifecycle().SetOnStopped(func() {
+		va.mu.Lock()
+		sess := va.session
+		w := va.w
+		t := va.autoLockTimer
+		va.session = nil
+		va.w = nil
+		va.autoLockTimer = nil
+		va.mu.Unlock()
+		if t != nil {
+			t.Stop()
+		}
+		if w != nil {
+			w.Stop()
+		}
+		if sess != nil {
+			sess.LockAndWipe()
+		}
+	})
 	a.Run()
 }
 
@@ -127,10 +142,11 @@ func (va *vaultApp) buildWindow() {
 
 	va.win.SetContent(container.NewPadded(content))
 
-	// Closing the window just hides it (tray stays active); Quit from the
-	// tray or menu fully exits.
+	// Closing the window locks the vault and hides it (tray stays active).
+	// This ensures the vault is always in a locked state when the window is
+	// not visible; the user must re-enter the password to resume.
 	va.win.SetCloseIntercept(func() {
-		va.win.Hide()
+		go va.doLockAndHide()
 	})
 
 	va.win.Show()
@@ -149,6 +165,8 @@ func (va *vaultApp) buildToolbar() *widget.Toolbar {
 	va.selectAllBtn.Disable()
 	va.deleteBtn = widget.NewButton("Delete", func() { va.doDelete() })
 	va.deleteBtn.Disable()
+	va.importBtn = widget.NewButton("Import File…", func() { go va.doImport() })
+	va.importBtn.Disable()
 	refreshBtn := widget.NewButton("Refresh", func() { va.doRefresh() })
 
 	return widget.NewToolbar(
@@ -157,6 +175,7 @@ func (va *vaultApp) buildToolbar() *widget.Toolbar {
 		widget.NewToolbarSeparator(),
 		&toolbarWidget{va.lockBtn},
 		widget.NewToolbarSpacer(),
+		&toolbarWidget{va.importBtn},
 		&toolbarWidget{va.decryptBtn},
 		&toolbarWidget{va.selectAllBtn},
 		&toolbarWidget{va.deleteBtn},
@@ -304,7 +323,7 @@ func (va *vaultApp) setupTray() {
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("Lock Vault", func() { go va.doLock() }),
 		fyne.NewMenuItemSeparator(),
-		fyne.NewMenuItem("Quit", func() { va.app.Quit() }),
+		fyne.NewMenuItem("Quit", func() { go va.doLockAndQuit() }),
 	))
 }
 
@@ -312,19 +331,19 @@ func (va *vaultApp) setupTray() {
 
 // showCreateDialog presents a form for choosing vault dir, drop dir, and password.
 func (va *vaultApp) showCreateDialog() {
-	vaultDir := ""
-	dropDir := ""
-
-	vaultLabel := widget.NewLabel("(not selected)")
-	dropLabel := widget.NewLabel("(not selected)")
+	vaultEntry := widget.NewEntry()
+	vaultEntry.SetPlaceHolder("Type or paste path, or click Browse…")
+	vaultEntry.SetText(defaultVaultDir(va.app))
+	dropEntry := widget.NewEntry()
+	dropEntry.SetPlaceHolder("Type or paste path, or click Browse…")
+	dropEntry.SetText(defaultDropDir(va.app))
 
 	vaultPickBtn := widget.NewButtonWithIcon("Browse…", theme.FolderNewIcon(), func() {
 		dialog.ShowFolderOpen(func(u fyne.ListableURI, err error) {
 			if err != nil || u == nil {
 				return
 			}
-			vaultDir = u.Path()
-			vaultLabel.SetText(vaultDir)
+			vaultEntry.SetText(u.Path())
 		}, va.win)
 	})
 	dropPickBtn := widget.NewButtonWithIcon("Browse…", theme.FolderOpenIcon(), func() {
@@ -332,8 +351,7 @@ func (va *vaultApp) showCreateDialog() {
 			if err != nil || u == nil {
 				return
 			}
-			dropDir = u.Path()
-			dropLabel.SetText(dropDir)
+			dropEntry.SetText(u.Path())
 		}, va.win)
 	})
 
@@ -342,12 +360,23 @@ func (va *vaultApp) showCreateDialog() {
 	pass2 := widget.NewPasswordEntry()
 	pass2.SetPlaceHolder("Confirm password")
 
+	var vaultHintText string
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		vaultHintText = "After creation the vault folder is hidden from the OS file " +
+			"browser (macOS/Windows).\nNote its full path so you can open it by typing it here next time."
+	} else {
+		vaultHintText = "Note the full path to this folder — you will need to type it here to open it later."
+	}
+	vaultHint := widget.NewLabel(vaultHintText)
+	vaultHint.Wrapping = fyne.TextWrapWord
+
 	form := container.NewVBox(
 		widget.NewLabelWithStyle("Vault Folder", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		container.NewBorder(nil, nil, nil, vaultPickBtn, vaultLabel),
+		container.NewBorder(nil, nil, nil, vaultPickBtn, vaultEntry),
+		vaultHint,
 		widget.NewSeparator(),
 		widget.NewLabelWithStyle("Drop Folder (auto-encrypt incoming files)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		container.NewBorder(nil, nil, nil, dropPickBtn, dropLabel),
+		container.NewBorder(nil, nil, nil, dropPickBtn, dropEntry),
 		widget.NewSeparator(),
 		widget.NewLabelWithStyle("Password", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		pass1,
@@ -359,6 +388,8 @@ func (va *vaultApp) showCreateDialog() {
 			if !ok {
 				return
 			}
+			vaultDir := strings.TrimSpace(vaultEntry.Text)
+			dropDir := strings.TrimSpace(dropEntry.Text)
 			if vaultDir == "" || dropDir == "" {
 				dialog.ShowError(fmt.Errorf("vault and drop folders are required"), va.win)
 				return
@@ -374,7 +405,7 @@ func (va *vaultApp) showCreateDialog() {
 			}
 			go va.doCreate(vaultDir, dropDir, p)
 		}, va.win)
-	d.Resize(fyne.NewSize(540, 0))
+	d.Resize(fyne.NewSize(560, 0))
 	d.Show()
 }
 
@@ -389,19 +420,19 @@ func (va *vaultApp) doCreate(vaultDir, dropDir, pass string) {
 // showOpenDialog presents a form for choosing an existing vault dir, drop dir,
 // and the unlock password.
 func (va *vaultApp) showOpenDialog() {
-	vaultDir := ""
-	dropDir := ""
-
-	vaultLabel := widget.NewLabel("(not selected)")
-	dropLabel := widget.NewLabel("(not selected)")
+	vaultEntry := widget.NewEntry()
+	vaultEntry.SetPlaceHolder("Type or paste path, or click Browse…")
+	vaultEntry.SetText(defaultVaultDir(va.app))
+	dropEntry := widget.NewEntry()
+	dropEntry.SetPlaceHolder("Type or paste path, or click Browse…")
+	dropEntry.SetText(defaultDropDir(va.app))
 
 	vaultPickBtn := widget.NewButtonWithIcon("Browse…", theme.FolderOpenIcon(), func() {
 		dialog.ShowFolderOpen(func(u fyne.ListableURI, err error) {
 			if err != nil || u == nil {
 				return
 			}
-			vaultDir = u.Path()
-			vaultLabel.SetText(vaultDir)
+			vaultEntry.SetText(u.Path())
 		}, va.win)
 	})
 	dropPickBtn := widget.NewButtonWithIcon("Browse…", theme.FolderOpenIcon(), func() {
@@ -409,20 +440,30 @@ func (va *vaultApp) showOpenDialog() {
 			if err != nil || u == nil {
 				return
 			}
-			dropDir = u.Path()
-			dropLabel.SetText(dropDir)
+			dropEntry.SetText(u.Path())
 		}, va.win)
 	})
 
 	passEntry := widget.NewPasswordEntry()
 	passEntry.SetPlaceHolder("Vault password")
 
+	var vaultHintText string
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		vaultHintText = "The vault folder is hidden from the OS file browser (macOS/Windows). " +
+			"Type its full path here if the Browse dialog does not show it."
+	} else {
+		vaultHintText = "Type the full path to the vault folder, or use Browse to navigate to it."
+	}
+	vaultHint := widget.NewLabel(vaultHintText)
+	vaultHint.Wrapping = fyne.TextWrapWord
+
 	form := container.NewVBox(
 		widget.NewLabelWithStyle("Vault Folder", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		container.NewBorder(nil, nil, nil, vaultPickBtn, vaultLabel),
+		container.NewBorder(nil, nil, nil, vaultPickBtn, vaultEntry),
+		vaultHint,
 		widget.NewSeparator(),
 		widget.NewLabelWithStyle("Drop Folder", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		container.NewBorder(nil, nil, nil, dropPickBtn, dropLabel),
+		container.NewBorder(nil, nil, nil, dropPickBtn, dropEntry),
 		widget.NewSeparator(),
 		widget.NewLabelWithStyle("Password", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		passEntry,
@@ -433,17 +474,19 @@ func (va *vaultApp) showOpenDialog() {
 			if !ok {
 				return
 			}
+			vaultDir := strings.TrimSpace(vaultEntry.Text)
 			if vaultDir == "" {
 				dialog.ShowError(fmt.Errorf("vault folder is required"), va.win)
 				return
 			}
+			dropDir := strings.TrimSpace(dropEntry.Text)
 			if dropDir == "" {
 				dialog.ShowError(fmt.Errorf("drop folder is required"), va.win)
 				return
 			}
 			go va.startSession(vaultDir, dropDir, passEntry.Text)
 		}, va.win)
-	d.Resize(fyne.NewSize(540, 0))
+	d.Resize(fyne.NewSize(560, 0))
 	d.Show()
 }
 
@@ -492,6 +535,24 @@ func (va *vaultApp) startSession(vaultDir, dropDir, pass string) {
 	va.vaultPath = vaultDir
 	va.dropPath = dropDir
 	va.w = w
+	// (Re-)start the auto-lock countdown. Cancel any previous timer first in
+	// case startSession is called while a vault is already open.
+	if va.autoLockTimer != nil {
+		va.autoLockTimer.Stop()
+	}
+	va.sessionGen++
+	thisGen := va.sessionGen
+	va.autoLockTimer = time.AfterFunc(autoLockDuration, func() {
+		// Guard against the narrow race where a new session is started between
+		// the timer firing and this callback executing: if the generation has
+		// advanced, a newer session is active and we must not lock it.
+		va.mu.Lock()
+		valid := va.sessionGen == thisGen
+		va.mu.Unlock()
+		if valid {
+			va.doLock()
+		}
+	})
 	va.mu.Unlock()
 
 	va.refreshEntries()
@@ -510,6 +571,7 @@ func (va *vaultApp) doLock() {
 	va.mu.Lock()
 	w := va.w
 	sess := va.session
+	t := va.autoLockTimer
 	va.w = nil
 	va.session = nil
 	va.vaultPath = ""
@@ -517,7 +579,16 @@ func (va *vaultApp) doLock() {
 	va.entries = nil
 	va.selected = -1
 	va.selectedRows = make(map[int]bool)
+	va.autoLockTimer = nil
+	va.sessionGen++ // Invalidate any pending auto-lock timer for this session.
 	va.mu.Unlock()
+
+	// Stop the auto-lock countdown so it does not fire a second time after a
+	// manual lock (the CAS guard above would swallow it, but stopping the
+	// timer avoids the unnecessary goroutine wakeup).
+	if t != nil {
+		t.Stop()
+	}
 
 	// Disable interactive controls immediately so the user cannot trigger
 	// another lock (or decrypt/delete) while the watcher is still draining.
@@ -528,6 +599,7 @@ func (va *vaultApp) doLock() {
 		va.decryptBtn.Disable()
 		va.deleteBtn.Disable()
 		va.selectAllBtn.Disable()
+		va.importBtn.Disable()
 	})
 
 	if w != nil {
@@ -541,6 +613,21 @@ func (va *vaultApp) doLock() {
 	va.updateStatus()
 }
 
+// doLockAndHide locks the vault and then hides the window.
+// It is used by the window close-button intercept: the vault is always in a
+// locked state when the window is not visible.
+func (va *vaultApp) doLockAndHide() {
+	va.doLock()
+	fyne.Do(func() { va.win.Hide() })
+}
+
+// doLockAndQuit locks the vault (draining any in-flight encryptions) and then
+// terminates the application. It is the safe Quit path from the tray menu.
+func (va *vaultApp) doLockAndQuit() {
+	va.doLock()
+	va.app.Quit()
+}
+
 // setLocked adjusts which toolbar buttons are enabled.
 // Safe to call from any goroutine.
 func (va *vaultApp) setLocked(locked bool) {
@@ -551,9 +638,11 @@ func (va *vaultApp) setLocked(locked bool) {
 			va.deleteBtn.Disable()
 			va.selectAllBtn.Disable()
 			va.selectAllBtn.SetText("Select All")
+			va.importBtn.Disable()
 		} else {
 			va.lockBtn.Enable()
 			va.selectAllBtn.Enable()
+			va.importBtn.Enable()
 		}
 	})
 }
@@ -773,6 +862,42 @@ func (va *vaultApp) doSelectAll() {
 	}
 }
 
+// ── Import ────────────────────────────────────────────────────────────────────
+
+// doImport opens a file picker and encrypts the chosen file directly into the
+// active vault. This is the primary way to add files on Android and iOS (where
+// the drop-folder watcher is a no-op) and a convenient alternative on desktop.
+func (va *vaultApp) doImport() {
+	va.mu.Lock()
+	sess := va.session
+	va.mu.Unlock()
+	if sess == nil {
+		return
+	}
+
+	d := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
+		if err != nil || r == nil {
+			return
+		}
+		vRel := r.URI().Name()
+		go func() {
+			defer r.Close()
+			if encErr := vault.UpsertStreamToVault(sess, vRel, r, -1); encErr != nil {
+				va.showErrorOnMain("Import failed", encErr)
+				return
+			}
+			va.showInfoOnMain("Imported", fmt.Sprintf("Encrypted and stored:\n%s", vRel))
+			if va.refreshPending.CompareAndSwap(false, true) {
+				go func() {
+					defer va.refreshPending.Store(false)
+					va.refreshEntries()
+				}()
+			}
+		}()
+	}, va.win)
+	d.Show()
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 func (va *vaultApp) showErrorOnMain(ctx string, err error) {
@@ -797,280 +922,3 @@ func guiFormatSize(n int64) string {
 	}
 }
 
-// ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  CLI                                                                     ║
-// ╚══════════════════════════════════════════════════════════════════════════╝
-
-// runCLI handles the text-based interface used when a sub-command is given.
-func runCLI() {
-	if len(os.Args) < 2 {
-		cliUsage()
-		os.Exit(1)
-	}
-	switch os.Args[1] {
-	case "create":
-		cmdCreate(os.Args[2:])
-	case "watch":
-		cmdWatch(os.Args[2:])
-	case "list", "ls":
-		cmdList(os.Args[2:])
-	case "decrypt", "get":
-		cmdDecrypt(os.Args[2:])
-	case "delete", "rm":
-		cmdDelete(os.Args[2:])
-	case "-h", "--help", "help":
-		cliUsage()
-	default:
-		fmt.Fprintf(os.Stderr, "nexvault: unknown command %q\n\n", os.Args[1])
-		cliUsage()
-		os.Exit(1)
-	}
-}
-
-func cliUsage() {
-	fmt.Fprint(os.Stderr, `nexvault — encrypted file vault
-
-usage:
-  nexvault                       launch the graphical interface
-  nexvault <command> [flags]     use the command-line interface
-
-commands:
-  create    initialise a new vault
-  watch     watch a drop folder and auto-encrypt every file placed there
-  list      list vault entries                           (aliases: ls)
-  decrypt   decrypt a vault entry to disk               (aliases: get)
-  delete    remove an entry from the vault              (aliases: rm)
-
-flags:
-  -vault <path>   vault directory (required by all commands)
-
-watch flags:
-  -drop  <path>   folder to watch for incoming files (required; created if absent)
-
-decrypt flags:
-  -entry <path>   vault-relative path of the entry (required)
-  -out   <path>   destination file path (required)
-
-delete flags:
-  -entry <path>   vault-relative path of the entry (required)
-`)
-}
-
-// ── create ───────────────────────────────────────────────────────────────────
-
-func cmdCreate(args []string) {
-	fs := flag.NewFlagSet("create", flag.ExitOnError)
-	vaultDir := fs.String("vault", "", "vault directory (required)")
-	cliMustParse(fs, args)
-	cliRequireFlag("create", "-vault", *vaultDir)
-
-	pass, err := cliReadNewPassword()
-	cliDie(err)
-	cliDie(vault.CreateVault(*vaultDir, pass))
-	fmt.Printf("vault created: %s\n", *vaultDir)
-}
-
-// ── watch ────────────────────────────────────────────────────────────────────
-
-func cmdWatch(args []string) {
-	fs := flag.NewFlagSet("watch", flag.ExitOnError)
-	vaultDir := fs.String("vault", "", "vault directory (required)")
-	dropDir := fs.String("drop", "", "folder to watch for incoming files (required)")
-	cliMustParse(fs, args)
-	cliRequireFlag("watch", "-vault", *vaultDir)
-	cliRequireFlag("watch", "-drop", *dropDir)
-
-	pass, err := cliReadPassword("vault password: ")
-	cliDie(err)
-
-	var sess vault.Session
-	cliDie(cliWithMsg(vault.UnlockVault(&sess, *vaultDir, pass), "unlock failed"))
-	fmt.Println("vault unlocked.")
-
-	cliDie(os.MkdirAll(*dropDir, 0700))
-
-	logFn := func(msg string) {
-		fmt.Printf("[%s] %s\n", time.Now().Format("15:04:05"), msg)
-	}
-
-	w, err := watcher.New(&sess, *dropDir, logFn)
-	cliDie(err)
-	cliDie(cliWithMsg(w.Start(), "watcher failed to start"))
-
-	fmt.Printf("watching: %s\npress ctrl-c to lock and exit.\n", *dropDir)
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
-	<-quit
-
-	fmt.Println("\nlocking vault...")
-	w.Stop()
-	sess.LockAndWipe()
-	fmt.Println("done.")
-}
-
-// ── list ─────────────────────────────────────────────────────────────────────
-
-func cmdList(args []string) {
-	fs := flag.NewFlagSet("list", flag.ExitOnError)
-	vaultDir := fs.String("vault", "", "vault directory (required)")
-	cliMustParse(fs, args)
-	cliRequireFlag("list", "-vault", *vaultDir)
-
-	sess := cliOpenSession(*vaultDir)
-	defer sess.LockAndWipe()
-
-	idx, err := vault.LoadIndexForSession(sess)
-	cliDie(err)
-
-	entries := append([]vault.IndexEntry(nil), idx.Entries...)
-	sort.Slice(entries, func(i, j int) bool {
-		return strings.ToLower(entries[i].VaultRelPath) < strings.ToLower(entries[j].VaultRelPath)
-	})
-
-	if len(entries) == 0 {
-		fmt.Println("vault is empty.")
-		return
-	}
-
-	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "PATH\tSIZE\tGEN\tADDED")
-	for _, e := range entries {
-		fmt.Fprintf(tw, "%s\t%d\t%d\t%s\n",
-			e.VaultRelPath, e.Size, e.Gen,
-			time.Unix(e.Added, 0).Format("2006-01-02 15:04"))
-	}
-	_ = tw.Flush()
-}
-
-// ── decrypt ──────────────────────────────────────────────────────────────────
-
-func cmdDecrypt(args []string) {
-	fs := flag.NewFlagSet("decrypt", flag.ExitOnError)
-	vaultDir := fs.String("vault", "", "vault directory (required)")
-	entry := fs.String("entry", "", "vault-relative entry path (required)")
-	outPath := fs.String("out", "", "output file path (required)")
-	cliMustParse(fs, args)
-	cliRequireFlag("decrypt", "-vault", *vaultDir)
-	cliRequireFlag("decrypt", "-entry", *entry)
-	cliRequireFlag("decrypt", "-out", *outPath)
-
-	sess := cliOpenSession(*vaultDir)
-	defer sess.LockAndWipe()
-
-	out, err := os.OpenFile(*outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-	cliDie(err)
-	ok := false
-	defer func() {
-		_ = out.Close()
-		if !ok {
-			_ = os.Remove(*outPath)
-		}
-	}()
-
-	n, err := vault.DecryptToWriterByVaultPath(sess, *entry, out)
-	cliDie(err)
-	ok = true
-	fmt.Printf("decrypted: %s -> %s (%d bytes)\n", *entry, *outPath, n)
-}
-
-// ── delete ───────────────────────────────────────────────────────────────────
-
-func cmdDelete(args []string) {
-	fs := flag.NewFlagSet("delete", flag.ExitOnError)
-	vaultDir := fs.String("vault", "", "vault directory (required)")
-	entry := fs.String("entry", "", "vault-relative entry path (required)")
-	cliMustParse(fs, args)
-	cliRequireFlag("delete", "-vault", *vaultDir)
-	cliRequireFlag("delete", "-entry", *entry)
-
-	sess := cliOpenSession(*vaultDir)
-	defer sess.LockAndWipe()
-
-	fmt.Printf("delete %q from vault? [y/N] ", *entry)
-	if !cliConfirmYN() {
-		fmt.Println("aborted.")
-		return
-	}
-
-	cliDie(vault.DeleteEntry(sess, *entry))
-	fmt.Printf("deleted: %s\n", *entry)
-}
-
-// ── CLI helpers ───────────────────────────────────────────────────────────────
-
-var stdinReader = bufio.NewReader(os.Stdin)
-
-func cliOpenSession(vaultDir string) *vault.Session {
-	pass, err := cliReadPassword("vault password: ")
-	cliDie(err)
-	sess := new(vault.Session)
-	cliDie(cliWithMsg(vault.UnlockVault(sess, vaultDir, pass), "unlock failed"))
-	return sess
-}
-
-func cliReadPassword(prompt string) (string, error) {
-	fmt.Fprint(os.Stderr, prompt)
-	fd := int(os.Stdin.Fd())
-	if term.IsTerminal(fd) {
-		b, err := term.ReadPassword(fd)
-		fmt.Fprintln(os.Stderr)
-		if err != nil {
-			return "", err
-		}
-		return string(b), nil
-	}
-	line, err := stdinReader.ReadString('\n')
-	return strings.TrimRight(line, "\r\n"), err
-}
-
-func cliReadNewPassword() (string, error) {
-	p1, err := cliReadPassword("new vault password: ")
-	if err != nil {
-		return "", err
-	}
-	p2, err := cliReadPassword("confirm password:    ")
-	if err != nil {
-		return "", err
-	}
-	if p1 != p2 {
-		return "", errors.New("passwords do not match")
-	}
-	if p1 == "" {
-		return "", errors.New("password must not be empty")
-	}
-	return p1, nil
-}
-
-func cliConfirmYN() bool {
-	line, _ := stdinReader.ReadString('\n')
-	s := strings.ToLower(strings.TrimSpace(line))
-	return s == "y" || s == "yes"
-}
-
-func cliDie(err error) {
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "nexvault: %v\n", err)
-		os.Exit(1)
-	}
-}
-
-func cliWithMsg(err error, msg string) error {
-	if err != nil {
-		return fmt.Errorf("%s: %w", msg, err)
-	}
-	return nil
-}
-
-func cliMustParse(fs *flag.FlagSet, args []string) {
-	if err := fs.Parse(args); err != nil {
-		cliDie(err)
-	}
-}
-
-func cliRequireFlag(cmd, flagName, val string) {
-	if val == "" {
-		fmt.Fprintf(os.Stderr, "nexvault %s: %s is required\n", cmd, flagName)
-		os.Exit(1)
-	}
-}

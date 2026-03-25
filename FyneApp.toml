@@ -1,0 +1,20 @@
+Website = "https://github.com/0x4E4558/0x4E4558Vault"
+
+[Details]
+  # Icon = "./Icon.png"  # Replace with a 1024×1024 PNG for dock / store icons
+  Name    = "nexvault"
+  ID      = "io.nexvault.app"
+  Version = "1.0.0"
+  Build   = 1
+
+# To build an Android APK (requires Android SDK + NDK and the fyne CLI tool):
+#
+#   go install fyne.io/fyne/v2/cmd/fyne@latest
+#   fyne package -os android -appID io.nexvault.app -icon Icon.png
+#
+# The resulting nexvault.apk can be installed on any Android device with
+# "Install from unknown sources" enabled, or distributed via the Play Store.
+#
+# To build for iOS (requires Xcode on macOS):
+#
+#   fyne package -os ios -appID io.nexvault.app -icon Icon.png
