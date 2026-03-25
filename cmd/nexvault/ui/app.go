@@ -77,6 +77,23 @@ func runGUI() {
 	va := &vaultApp{app: a, selected: -1, selectedRows: make(map[int]bool)}
 	va.buildWindow()
 	va.setupTray()
+	// Safety net: if the OS terminates the process while a vault is open,
+	// wipe the in-memory keys before the process exits. This runs after
+	// a.Run() returns (i.e. after Quit() is called).
+	a.Lifecycle().SetOnStopped(func() {
+		va.mu.Lock()
+		sess := va.session
+		w := va.w
+		va.session = nil
+		va.w = nil
+		va.mu.Unlock()
+		if w != nil {
+			w.Stop()
+		}
+		if sess != nil {
+			sess.LockAndWipe()
+		}
+	})
 	a.Run()
 }
 
@@ -103,10 +120,11 @@ func (va *vaultApp) buildWindow() {
 
 	va.win.SetContent(container.NewPadded(content))
 
-	// Closing the window just hides it (tray stays active); Quit from the
-	// tray or menu fully exits.
+	// Closing the window locks the vault and hides it (tray stays active).
+	// This ensures the vault is always in a locked state when the window is
+	// not visible; the user must re-enter the password to resume.
 	va.win.SetCloseIntercept(func() {
-		va.win.Hide()
+		go va.doLockAndHide()
 	})
 
 	va.win.Show()
@@ -283,7 +301,7 @@ func (va *vaultApp) setupTray() {
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("Lock Vault", func() { go va.doLock() }),
 		fyne.NewMenuItemSeparator(),
-		fyne.NewMenuItem("Quit", func() { va.app.Quit() }),
+		fyne.NewMenuItem("Quit", func() { go va.doLockAndQuit() }),
 	))
 }
 
@@ -529,6 +547,21 @@ func (va *vaultApp) doLock() {
 	va.setLocked(true)
 	fyne.Do(func() { va.table.Refresh() })
 	va.updateStatus()
+}
+
+// doLockAndHide locks the vault and then hides the window.
+// It is used by the window close-button intercept: the vault is always in a
+// locked state when the window is not visible.
+func (va *vaultApp) doLockAndHide() {
+	va.doLock()
+	fyne.Do(func() { va.win.Hide() })
+}
+
+// doLockAndQuit locks the vault (draining any in-flight encryptions) and then
+// terminates the application. It is the safe Quit path from the tray menu.
+func (va *vaultApp) doLockAndQuit() {
+	va.doLock()
+	va.app.Quit()
 }
 
 // setLocked adjusts which toolbar buttons are enabled.
