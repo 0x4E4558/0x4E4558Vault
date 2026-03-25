@@ -7,6 +7,7 @@
 package ui
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -81,10 +82,12 @@ type vaultApp struct {
 	statusLabel  *widget.Label
 	table        *widget.Table
 	decryptBtn   *widget.Button
+	editBtn      *widget.Button
 	deleteBtn    *widget.Button
 	lockBtn      *widget.Button
 	openBtn      *widget.Button
 	createBtn    *widget.Button
+	newNoteBtn   *widget.Button
 	selectAllBtn *widget.Button
 	importBtn    *widget.Button
 }
@@ -159,8 +162,13 @@ func (va *vaultApp) buildToolbar() *widget.Toolbar {
 	va.lockBtn.Importance = widget.DangerImportance
 	va.lockBtn.Disable()
 
+	va.newNoteBtn = widget.NewButton("New Note", func() { va.doNewNote() })
+	va.newNoteBtn.Disable()
+
 	va.decryptBtn = widget.NewButton("Decrypt…", func() { va.doDecrypt() })
 	va.decryptBtn.Disable()
+	va.editBtn = widget.NewButton("Edit…", func() { go va.doEditEntry() })
+	va.editBtn.Disable()
 	va.selectAllBtn = widget.NewButton("Select All", func() { va.doSelectAll() })
 	va.selectAllBtn.Disable()
 	va.deleteBtn = widget.NewButton("Delete", func() { va.doDelete() })
@@ -175,8 +183,12 @@ func (va *vaultApp) buildToolbar() *widget.Toolbar {
 		widget.NewToolbarSeparator(),
 		&toolbarWidget{va.lockBtn},
 		widget.NewToolbarSpacer(),
+		&toolbarWidget{va.newNoteBtn},
+		widget.NewToolbarSeparator(),
 		&toolbarWidget{va.importBtn},
 		&toolbarWidget{va.decryptBtn},
+		&toolbarWidget{va.editBtn},
+		widget.NewToolbarSeparator(),
 		&toolbarWidget{va.selectAllBtn},
 		&toolbarWidget{va.deleteBtn},
 		widget.NewToolbarSeparator(),
@@ -289,9 +301,17 @@ func (va *vaultApp) buildTable() *widget.Table {
 	tbl.OnSelected = func(id widget.TableCellID) {
 		va.mu.Lock()
 		va.selected = id.Row
+		entryPath := ""
+		if id.Row >= 0 && id.Row < len(va.entries) {
+			entryPath = va.entries[id.Row].VaultRelPath
+		}
 		va.mu.Unlock()
 		va.decryptBtn.Enable()
 		va.deleteBtn.Enable()
+		// Edit button is only available for recognised text-format entries.
+		if va.editBtn != nil && isTextEntry(entryPath) {
+			va.editBtn.Enable()
+		}
 	}
 	tbl.OnUnselected = func(_ widget.TableCellID) {
 		va.mu.Lock()
@@ -299,6 +319,9 @@ func (va *vaultApp) buildTable() *widget.Table {
 		count := len(va.selectedRows)
 		va.mu.Unlock()
 		va.decryptBtn.Disable()
+		if va.editBtn != nil {
+			va.editBtn.Disable()
+		}
 		if count == 0 {
 			va.deleteBtn.Disable()
 		}
@@ -377,6 +400,7 @@ func (va *vaultApp) showCreateDialog() {
 		widget.NewSeparator(),
 		widget.NewLabelWithStyle("Drop Folder (auto-encrypt incoming files)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		container.NewBorder(nil, nil, nil, dropPickBtn, dropEntry),
+		dropFolderWarning(),
 		widget.NewSeparator(),
 		widget.NewLabelWithStyle("Password", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		pass1,
@@ -464,6 +488,7 @@ func (va *vaultApp) showOpenDialog() {
 		widget.NewSeparator(),
 		widget.NewLabelWithStyle("Drop Folder", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		container.NewBorder(nil, nil, nil, dropPickBtn, dropEntry),
+		dropFolderWarning(),
 		widget.NewSeparator(),
 		widget.NewLabelWithStyle("Password", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		passEntry,
@@ -596,7 +621,9 @@ func (va *vaultApp) doLock() {
 	// pending files have been encrypted.
 	fyne.Do(func() {
 		va.lockBtn.Disable()
+		va.newNoteBtn.Disable()
 		va.decryptBtn.Disable()
+		va.editBtn.Disable()
 		va.deleteBtn.Disable()
 		va.selectAllBtn.Disable()
 		va.importBtn.Disable()
@@ -634,15 +661,19 @@ func (va *vaultApp) setLocked(locked bool) {
 	fyne.Do(func() {
 		if locked {
 			va.lockBtn.Disable()
+			va.newNoteBtn.Disable()
 			va.decryptBtn.Disable()
+			va.editBtn.Disable()
 			va.deleteBtn.Disable()
 			va.selectAllBtn.Disable()
 			va.selectAllBtn.SetText("Select All")
 			va.importBtn.Disable()
 		} else {
 			va.lockBtn.Enable()
+			va.newNoteBtn.Enable()
 			va.selectAllBtn.Enable()
 			va.importBtn.Enable()
+			// editBtn is only enabled when a text entry is selected
 		}
 	})
 }
@@ -898,7 +929,145 @@ func (va *vaultApp) doImport() {
 	d.Show()
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Built-in text editor ──────────────────────────────────────────────────────
+
+// isTextEntry reports whether the vault entry at name is a text format that
+// the built-in editor can open.
+func isTextEntry(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".txt", ".md", ".markdown", ".log", ".csv",
+		".json", ".xml", ".yaml", ".yml", ".toml",
+		".ini", ".cfg", ".conf":
+		return true
+	}
+	return false
+}
+
+// doNewNote opens a built-in text editor dialog so the user can compose a note
+// and encrypt it directly into the vault without using the drop folder.
+func (va *vaultApp) doNewNote() {
+	va.mu.Lock()
+	sess := va.session
+	va.mu.Unlock()
+	if sess == nil {
+		return
+	}
+
+	nameEntry := widget.NewEntry()
+	nameEntry.SetText("note.txt")
+	nameEntry.SetPlaceHolder("filename (e.g. note.txt)")
+
+	textEntry := widget.NewMultiLineEntry()
+	textEntry.SetPlaceHolder("Type your note here…")
+	textEntry.Wrapping = fyne.TextWrapWord
+
+	form := container.NewBorder(
+		container.NewVBox(
+			widget.NewLabelWithStyle("Filename", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+			nameEntry,
+			widget.NewSeparator(),
+			widget.NewLabelWithStyle("Content", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		),
+		nil, nil, nil,
+		textEntry,
+	)
+
+	d := dialog.NewCustomConfirm("New Text Note", "Save to Vault", "Cancel", form,
+		func(ok bool) {
+			if !ok {
+				return
+			}
+			name := strings.TrimSpace(nameEntry.Text)
+			if name == "" {
+				dialog.ShowError(fmt.Errorf("filename is required"), va.win)
+				return
+			}
+			text := textEntry.Text
+			go func() {
+				data := []byte(text)
+				if err := vault.UpsertStreamToVault(sess, name, bytes.NewReader(data), int64(len(data))); err != nil {
+					va.showErrorOnMain("Save note", err)
+					return
+				}
+				va.showInfoOnMain("Note saved", fmt.Sprintf("Encrypted and stored:\n%s", name))
+				if va.refreshPending.CompareAndSwap(false, true) {
+					go func() {
+						defer va.refreshPending.Store(false)
+						va.refreshEntries()
+					}()
+				}
+			}()
+		}, va.win)
+	d.Resize(fyne.NewSize(640, 480))
+	d.Show()
+}
+
+// doEditEntry decrypts the selected text entry and opens it in the built-in
+// editor. On save the modified content is re-encrypted into the vault.
+func (va *vaultApp) doEditEntry() {
+	va.mu.Lock()
+	sel := va.selected
+	entries := va.entries
+	sess := va.session
+	va.mu.Unlock()
+
+	if sel < 0 || sel >= len(entries) || sess == nil {
+		return
+	}
+	entry := entries[sel]
+
+	const maxTextSize = 10 << 20 // 10 MB
+
+	var buf bytes.Buffer
+	buf.Grow(int(min(entry.Size+1, int64(maxTextSize))))
+	if _, err := vault.DecryptToWriterByVaultPath(sess, entry.VaultRelPath, &buf); err != nil {
+		va.showErrorOnMain("Open entry", err)
+		return
+	}
+	if buf.Len() > maxTextSize {
+		va.showErrorOnMain("Open entry",
+			fmt.Errorf("file is too large for the built-in editor (%s)", guiFormatSize(int64(buf.Len()))))
+		return
+	}
+	text := buf.String()
+	fyne.Do(func() { va.showTextEditorDialog(entry.VaultRelPath, text, sess) })
+}
+
+// showTextEditorDialog presents an editable text area for vaultRelPath. On
+// save the content is re-encrypted into the vault via UpsertStreamToVault.
+func (va *vaultApp) showTextEditorDialog(vaultRelPath, initialText string, sess *vault.Session) {
+	textEntry := widget.NewMultiLineEntry()
+	textEntry.SetText(initialText)
+	textEntry.Wrapping = fyne.TextWrapWord
+
+	d := dialog.NewCustomConfirm(
+		"Edit: "+filepath.Base(vaultRelPath),
+		"Save to Vault", "Cancel",
+		textEntry,
+		func(ok bool) {
+			if !ok {
+				return
+			}
+			text := textEntry.Text
+			go func() {
+				data := []byte(text)
+				if err := vault.UpsertStreamToVault(sess, vaultRelPath, bytes.NewReader(data), int64(len(data))); err != nil {
+					va.showErrorOnMain("Save failed", err)
+					return
+				}
+				if va.refreshPending.CompareAndSwap(false, true) {
+					go func() {
+						defer va.refreshPending.Store(false)
+						va.refreshEntries()
+					}()
+				}
+			}()
+		}, va.win)
+	d.Resize(fyne.NewSize(720, 540))
+	d.Show()
+}
+
+
 
 func (va *vaultApp) showErrorOnMain(ctx string, err error) {
 	// dialog.ShowError queues itself on the main thread internally.
@@ -909,7 +1078,14 @@ func (va *vaultApp) showInfoOnMain(title, msg string) {
 	dialog.ShowInformation(title, msg, va.win)
 }
 
-func guiFormatSize(n int64) string {
+// dropFolderWarning returns a label widget that explains the auto-encrypt-and-
+// delete behaviour of the drop folder, used in the Create and Open dialogs.
+func dropFolderWarning() *widget.Label {
+	l := widget.NewLabel("⚠️  Use a dedicated folder. Every file saved here is automatically\nencrypted into the vault and permanently deleted from disk.")
+	return l
+}
+
+
 	switch {
 	case n >= 1<<30:
 		return fmt.Sprintf("%.1f GB", float64(n)/float64(1<<30))
