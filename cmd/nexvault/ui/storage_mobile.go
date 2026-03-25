@@ -21,3 +21,7 @@ func defaultVaultDir(a fyne.App) string {
 func defaultDropDir(a fyne.App) string {
 	return filepath.Join(a.Storage().RootURI().Path(), "drop")
 }
+
+// saveLastPaths is a no-op on mobile: the vault and drop paths are fixed to
+// the app-private storage area, so there is nothing to persist.
+func saveLastPaths(_ fyne.App, _, _ string) {}
