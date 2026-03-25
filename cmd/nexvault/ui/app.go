@@ -145,11 +145,20 @@ func (va *vaultApp) buildWindow() {
 
 	va.win.SetContent(container.NewPadded(content))
 
-	// Closing the window locks the vault and hides it (tray stays active).
-	// This ensures the vault is always in a locked state when the window is
-	// not visible; the user must re-enter the password to resume.
+	// Add a menu bar so users have a standard place to find New Note and Quit.
+	va.win.SetMainMenu(fyne.NewMainMenu(
+		fyne.NewMenu("nexvault",
+			fyne.NewMenuItem("New Encrypted Note", func() { va.doNewNote() }),
+			fyne.NewMenuItemSeparator(),
+			fyne.NewMenuItem("Quit nexvault", func() { go va.doLockAndQuit() }),
+		),
+	))
+
+	// Closing the window locks the vault and exits the application so that
+	// the terminal session (if any) is released immediately. Users who want
+	// the vault to remain active should minimise the window instead of closing it.
 	va.win.SetCloseIntercept(func() {
-		go va.doLockAndHide()
+		go va.doLockAndQuit()
 	})
 
 	va.win.Show()
@@ -343,6 +352,11 @@ func (va *vaultApp) setupTray() {
 			va.win.Show()
 			va.win.RequestFocus()
 		}),
+		fyne.NewMenuItem("New Encrypted Note", func() {
+			va.win.Show()
+			va.win.RequestFocus()
+			fyne.Do(func() { va.doNewNote() })
+		}),
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("Lock Vault", func() { go va.doLock() }),
 		fyne.NewMenuItemSeparator(),
@@ -438,6 +452,13 @@ func (va *vaultApp) doCreate(vaultDir, dropDir, pass string) {
 		va.showErrorOnMain("Create vault", err)
 		return
 	}
+	// Show the vault path so the user can note it — the folder is hidden from
+	// the OS file browser (macOS/Windows), so the path is the only way to find it.
+	fyne.Do(func() {
+		dialog.ShowInformation("Vault Created",
+			fmt.Sprintf("Vault created successfully.\n\nVault path (note this down):\n%s\n\nThe path is also saved for the next time you open the app.", vaultDir),
+			va.win)
+	})
 	va.startSession(vaultDir, dropDir, pass)
 }
 
@@ -473,8 +494,9 @@ func (va *vaultApp) showOpenDialog() {
 
 	var vaultHintText string
 	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
-		vaultHintText = "The vault folder is hidden from the OS file browser (macOS/Windows). " +
-			"Type its full path here if the Browse dialog does not show it."
+		vaultHintText = "The vault folder is hidden from the OS file browser (macOS/Windows) " +
+			"and cannot be found with Browse. Type or paste its full path. " +
+			"The path was shown when the vault was created and is pre-filled here if this device has opened it before."
 	} else {
 		vaultHintText = "Type the full path to the vault folder, or use Browse to navigate to it."
 	}
@@ -486,9 +508,9 @@ func (va *vaultApp) showOpenDialog() {
 		container.NewBorder(nil, nil, nil, vaultPickBtn, vaultEntry),
 		vaultHint,
 		widget.NewSeparator(),
-		widget.NewLabelWithStyle("Drop Folder", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabelWithStyle("Drop Folder (optional)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		container.NewBorder(nil, nil, nil, dropPickBtn, dropEntry),
-		dropFolderWarning(),
+		widget.NewLabel("Leave blank to open without auto-encrypt. Every file\nsaved here is encrypted into the vault and deleted from disk."),
 		widget.NewSeparator(),
 		widget.NewLabelWithStyle("Password", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		passEntry,
@@ -505,54 +527,62 @@ func (va *vaultApp) showOpenDialog() {
 				return
 			}
 			dropDir := strings.TrimSpace(dropEntry.Text)
-			if dropDir == "" {
-				dialog.ShowError(fmt.Errorf("drop folder is required"), va.win)
-				return
-			}
 			go va.startSession(vaultDir, dropDir, passEntry.Text)
 		}, va.win)
 	d.Resize(fyne.NewSize(560, 0))
 	d.Show()
 }
 
-// startSession unlocks the vault and starts the file watcher.
+// startSession unlocks the vault and, if a drop folder is given, starts the
+// file watcher. If dropDir is empty the vault opens without auto-encrypt.
 func (va *vaultApp) startSession(vaultDir, dropDir, pass string) {
 	sess := new(vault.Session)
 	if err := vault.UnlockVault(sess, vaultDir, pass); err != nil {
 		va.showErrorOnMain("Unlock failed", err)
 		return
 	}
-	if err := os.MkdirAll(dropDir, 0700); err != nil {
-		va.showErrorOnMain("Drop folder", err)
-		return
-	}
 
-	logFn := func(msg string) {
-		// Coalesced status update: at most one fyne.Do closure is ever
-		// queued regardless of how many files are encrypted in quick
-		// succession (e.g. bulk-importing 40 000 items).
-		va.updateStatus()
-		// Refresh the entry table so newly-encrypted files appear without
-		// the user having to click the Refresh button manually. The
-		// refreshPending flag coalesces rapid bursts: if a refresh is already
-		// in progress we skip the extra goroutine — the running one will read
-		// the latest index when it completes.
-		if va.refreshPending.CompareAndSwap(false, true) {
-			go func() {
-				defer va.refreshPending.Store(false)
-				va.refreshEntries()
-			}()
+	// Persist both paths immediately after a successful unlock so the Open
+	// dialog pre-fills them on the next launch. This is especially important
+	// on macOS where the vault folder is hidden (UF_HIDDEN) and cannot be
+	// found via the file picker.
+	saveLastPaths(va.app, vaultDir, dropDir)
+
+	var w *watcher.Watcher
+	if dropDir != "" {
+		if err := os.MkdirAll(dropDir, 0700); err != nil {
+			va.showErrorOnMain("Drop folder", err)
+			return
 		}
-	}
 
-	w, err := watcher.New(sess, dropDir, logFn)
-	if err != nil {
-		va.showErrorOnMain("Watcher init", err)
-		return
-	}
-	if err := w.Start(); err != nil {
-		va.showErrorOnMain("Watcher start", err)
-		return
+		logFn := func(msg string) {
+			// Coalesced status update: at most one fyne.Do closure is ever
+			// queued regardless of how many files are encrypted in quick
+			// succession (e.g. bulk-importing 40 000 items).
+			va.updateStatus()
+			// Refresh the entry table so newly-encrypted files appear without
+			// the user having to click the Refresh button manually. The
+			// refreshPending flag coalesces rapid bursts: if a refresh is already
+			// in progress we skip the extra goroutine — the running one will read
+			// the latest index when it completes.
+			if va.refreshPending.CompareAndSwap(false, true) {
+				go func() {
+					defer va.refreshPending.Store(false)
+					va.refreshEntries()
+				}()
+			}
+		}
+
+		var err error
+		w, err = watcher.New(sess, dropDir, logFn)
+		if err != nil {
+			va.showErrorOnMain("Watcher init", err)
+			return
+		}
+		if err := w.Start(); err != nil {
+			va.showErrorOnMain("Watcher start", err)
+			return
+		}
 	}
 
 	va.mu.Lock()
@@ -695,6 +725,8 @@ func (va *vaultApp) updateStatus() {
 		var text string
 		if sess == nil || !sess.Active {
 			text = "Status: locked — open or create a vault to begin"
+		} else if dp == "" {
+			text = fmt.Sprintf("Status: unlocked  •  Vault: %s  •  (no drop folder — use New Note or Import to add files)", vp)
 		} else {
 			text = fmt.Sprintf("Status: unlocked  •  Vault: %s  •  Watching: %s", vp, dp)
 		}
@@ -1081,11 +1113,10 @@ func (va *vaultApp) showInfoOnMain(title, msg string) {
 // dropFolderWarning returns a label widget that explains the auto-encrypt-and-
 // delete behaviour of the drop folder, used in the Create and Open dialogs.
 func dropFolderWarning() *widget.Label {
-	l := widget.NewLabel("⚠️  Use a dedicated folder. Every file saved here is automatically\nencrypted into the vault and permanently deleted from disk.")
-	return l
+	return widget.NewLabel("⚠️  Use a dedicated folder. Every file saved here is automatically\nencrypted into the vault and permanently deleted from disk.")
 }
 
-
+func guiFormatSize(n int64) string {
 	switch {
 	case n >= 1<<30:
 		return fmt.Sprintf("%.1f GB", float64(n)/float64(1<<30))
