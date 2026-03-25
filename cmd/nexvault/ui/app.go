@@ -94,6 +94,7 @@ type vaultApp struct {
 
 func runGUI() {
 	a := app.NewWithID("io.nexvault.app")
+	a.SetIcon(iconVaultPNG)
 	va := &vaultApp{app: a, selected: -1, selectedRows: make(map[int]bool)}
 	va.buildWindow()
 	va.setupTray()
@@ -126,6 +127,7 @@ func runGUI() {
 
 func (va *vaultApp) buildWindow() {
 	va.win = va.app.NewWindow("nexvault")
+	va.win.SetIcon(iconVaultPNG)
 	va.win.Resize(fyne.NewSize(960, 560))
 	va.win.SetMaster()
 
@@ -346,7 +348,7 @@ func (va *vaultApp) setupTray() {
 	if !ok {
 		return
 	}
-	desk.SetSystemTrayIcon(theme.StorageIcon())
+	desk.SetSystemTrayIcon(iconVaultPNG)
 	desk.SetSystemTrayMenu(fyne.NewMenu("nexvault",
 		fyne.NewMenuItem("Show nexvault", func() {
 			va.win.Show()
