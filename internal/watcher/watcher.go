@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -303,15 +302,12 @@ func (w *Watcher) shouldSkip(path string) bool {
 }
 
 // secureDelete overwrites a file with zeros before removing it from the
-// filesystem. O_NOFOLLOW prevents following a symlink that an attacker might
-// have substituted between the encrypt and delete steps (TOCTOU defence).
+// filesystem. openFileNoFollow refuses to follow a symlink that an attacker
+// might have substituted between the encrypt and delete steps (TOCTOU defence).
 // This wipe is best-effort: SSDs with wear-levelling may retain the old data
 // in unmapped sectors.
 func secureDelete(path string) error {
-	// O_NOFOLLOW causes the open to fail with ELOOP if path is a symlink,
-	// defending against a TOCTOU attack where an adversary swaps the plaintext
-	// file for a symlink to a sensitive target between the encrypt and delete.
-	f, err := os.OpenFile(path, os.O_WRONLY|syscall.O_NOFOLLOW, 0)
+	f, err := openFileNoFollow(path)
 	if err != nil {
 		return err
 	}

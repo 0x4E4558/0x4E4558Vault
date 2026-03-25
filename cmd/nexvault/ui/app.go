@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -61,12 +62,20 @@ type vaultApp struct {
 	refreshPending atomic.Bool
 
 	// locking prevents re-entrant doLock calls (e.g. toolbar button clicked
-	// while a tray-menu lock is already in progress).
+	// while a tray-menu lock is already in progress). It also means that the
+	// window close-intercept and tray-Quit paths are safe if triggered rapidly
+	// in succession — only the first call does real work.
 	locking atomic.Bool
 
 	// autoLockTimer fires doLock after autoLockDuration of the vault being
 	// unlocked. It is started in startSession and cancelled in doLock.
 	autoLockTimer *time.Timer
+
+	// sessionGen is incremented each time a new session is started or doLock
+	// runs. The auto-lock timer callback compares its captured generation
+	// against the current value to skip locking if a new session has started
+	// between when the timer fired and when the callback executes.
+	sessionGen uint64
 
 	// UI elements that are updated reactively
 	statusLabel  *widget.Label
@@ -324,8 +333,10 @@ func (va *vaultApp) setupTray() {
 func (va *vaultApp) showCreateDialog() {
 	vaultEntry := widget.NewEntry()
 	vaultEntry.SetPlaceHolder("Type or paste path, or click Browse…")
+	vaultEntry.SetText(defaultVaultDir(va.app))
 	dropEntry := widget.NewEntry()
 	dropEntry.SetPlaceHolder("Type or paste path, or click Browse…")
+	dropEntry.SetText(defaultDropDir(va.app))
 
 	vaultPickBtn := widget.NewButtonWithIcon("Browse…", theme.FolderNewIcon(), func() {
 		dialog.ShowFolderOpen(func(u fyne.ListableURI, err error) {
@@ -349,9 +360,14 @@ func (va *vaultApp) showCreateDialog() {
 	pass2 := widget.NewPasswordEntry()
 	pass2.SetPlaceHolder("Confirm password")
 
-	vaultHint := widget.NewLabel(
-		"After creation the vault folder is hidden from the OS file browser.\n" +
-			"Note its full path so you can open it by typing it here next time.")
+	var vaultHintText string
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		vaultHintText = "After creation the vault folder is hidden from the OS file " +
+			"browser (macOS/Windows).\nNote its full path so you can open it by typing it here next time."
+	} else {
+		vaultHintText = "Note the full path to this folder — you will need to type it here to open it later."
+	}
+	vaultHint := widget.NewLabel(vaultHintText)
 	vaultHint.Wrapping = fyne.TextWrapWord
 
 	form := container.NewVBox(
@@ -406,8 +422,10 @@ func (va *vaultApp) doCreate(vaultDir, dropDir, pass string) {
 func (va *vaultApp) showOpenDialog() {
 	vaultEntry := widget.NewEntry()
 	vaultEntry.SetPlaceHolder("Type or paste path, or click Browse…")
+	vaultEntry.SetText(defaultVaultDir(va.app))
 	dropEntry := widget.NewEntry()
 	dropEntry.SetPlaceHolder("Type or paste path, or click Browse…")
+	dropEntry.SetText(defaultDropDir(va.app))
 
 	vaultPickBtn := widget.NewButtonWithIcon("Browse…", theme.FolderOpenIcon(), func() {
 		dialog.ShowFolderOpen(func(u fyne.ListableURI, err error) {
@@ -429,9 +447,14 @@ func (va *vaultApp) showOpenDialog() {
 	passEntry := widget.NewPasswordEntry()
 	passEntry.SetPlaceHolder("Vault password")
 
-	vaultHint := widget.NewLabel(
-		"The vault folder is hidden from the OS file browser. " +
-			"Type its full path here if the Browse dialog does not show it.")
+	var vaultHintText string
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		vaultHintText = "The vault folder is hidden from the OS file browser (macOS/Windows). " +
+			"Type its full path here if the Browse dialog does not show it."
+	} else {
+		vaultHintText = "Type the full path to the vault folder, or use Browse to navigate to it."
+	}
+	vaultHint := widget.NewLabel(vaultHintText)
 	vaultHint.Wrapping = fyne.TextWrapWord
 
 	form := container.NewVBox(
@@ -517,7 +540,19 @@ func (va *vaultApp) startSession(vaultDir, dropDir, pass string) {
 	if va.autoLockTimer != nil {
 		va.autoLockTimer.Stop()
 	}
-	va.autoLockTimer = time.AfterFunc(autoLockDuration, func() { go va.doLock() })
+	va.sessionGen++
+	thisGen := va.sessionGen
+	va.autoLockTimer = time.AfterFunc(autoLockDuration, func() {
+		// Guard against the narrow race where a new session is started between
+		// the timer firing and this callback executing: if the generation has
+		// advanced, a newer session is active and we must not lock it.
+		va.mu.Lock()
+		valid := va.sessionGen == thisGen
+		va.mu.Unlock()
+		if valid {
+			va.doLock()
+		}
+	})
 	va.mu.Unlock()
 
 	va.refreshEntries()
@@ -545,6 +580,7 @@ func (va *vaultApp) doLock() {
 	va.selected = -1
 	va.selectedRows = make(map[int]bool)
 	va.autoLockTimer = nil
+	va.sessionGen++ // Invalidate any pending auto-lock timer for this session.
 	va.mu.Unlock()
 
 	// Stop the auto-lock countdown so it does not fire a second time after a

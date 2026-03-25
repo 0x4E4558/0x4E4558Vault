@@ -9,6 +9,8 @@ import "syscall"
 // fully accessible by path, which is how nexvault re-opens it on subsequent
 // sessions.
 func HideDirectory(dir string) error {
-	const ufHidden = 0x8000 // UF_HIDDEN — defined in <sys/stat.h>
+	// UF_HIDDEN = 0x8000, defined in <sys/stat.h>. Go's syscall package does
+	// not export this constant, so we use the numeric literal directly.
+	const ufHidden = 0x8000
 	return syscall.Chflags(dir, ufHidden)
 }

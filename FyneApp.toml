@@ -1,7 +1,7 @@
 Website = "https://github.com/0x4E4558/0x4E4558Vault"
 
 [Details]
-  Icon    = "./Icon.png"
+  # Icon = "./Icon.png"  # Replace with a 1024×1024 PNG for dock / store icons
   Name    = "nexvault"
   ID      = "io.nexvault.app"
   Version = "1.0.0"
