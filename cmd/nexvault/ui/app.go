@@ -28,6 +28,10 @@ import (
 	"nexvault/internal/watcher"
 )
 
+// autoLockDuration is the period of inactivity after which an unlocked vault
+// is automatically locked. 1800 seconds = 30 minutes.
+const autoLockDuration = 1800 * time.Second
+
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║  GUI                                                                     ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
@@ -60,6 +64,10 @@ type vaultApp struct {
 	// while a tray-menu lock is already in progress).
 	locking atomic.Bool
 
+	// autoLockTimer fires doLock after autoLockDuration of the vault being
+	// unlocked. It is started in startSession and cancelled in doLock.
+	autoLockTimer *time.Timer
+
 	// UI elements that are updated reactively
 	statusLabel  *widget.Label
 	table        *widget.Table
@@ -84,9 +92,14 @@ func runGUI() {
 		va.mu.Lock()
 		sess := va.session
 		w := va.w
+		t := va.autoLockTimer
 		va.session = nil
 		va.w = nil
+		va.autoLockTimer = nil
 		va.mu.Unlock()
+		if t != nil {
+			t.Stop()
+		}
 		if w != nil {
 			w.Stop()
 		}
@@ -499,6 +512,12 @@ func (va *vaultApp) startSession(vaultDir, dropDir, pass string) {
 	va.vaultPath = vaultDir
 	va.dropPath = dropDir
 	va.w = w
+	// (Re-)start the auto-lock countdown. Cancel any previous timer first in
+	// case startSession is called while a vault is already open.
+	if va.autoLockTimer != nil {
+		va.autoLockTimer.Stop()
+	}
+	va.autoLockTimer = time.AfterFunc(autoLockDuration, func() { go va.doLock() })
 	va.mu.Unlock()
 
 	va.refreshEntries()
@@ -517,6 +536,7 @@ func (va *vaultApp) doLock() {
 	va.mu.Lock()
 	w := va.w
 	sess := va.session
+	t := va.autoLockTimer
 	va.w = nil
 	va.session = nil
 	va.vaultPath = ""
@@ -524,7 +544,15 @@ func (va *vaultApp) doLock() {
 	va.entries = nil
 	va.selected = -1
 	va.selectedRows = make(map[int]bool)
+	va.autoLockTimer = nil
 	va.mu.Unlock()
+
+	// Stop the auto-lock countdown so it does not fire a second time after a
+	// manual lock (the CAS guard above would swallow it, but stopping the
+	// timer avoids the unnecessary goroutine wakeup).
+	if t != nil {
+		t.Stop()
+	}
 
 	// Disable interactive controls immediately so the user cannot trigger
 	// another lock (or decrypt/delete) while the watcher is still draining.
