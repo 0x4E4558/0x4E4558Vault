@@ -155,9 +155,33 @@ func (w *Watcher) handleEvent(ev fsnotify.Event) {
 	}
 
 	if info.IsDir() {
-		// Newly created directory: start watching it.
-		if ev.Has(fsnotify.Create) {
-			_ = w.fsw.Add(path)
+		// Newly created directory: watch it and all its descendants, then queue
+		// any files already inside it. When a whole directory tree is moved
+		// (dragged-and-dropped) into the drop folder the OS emits a single
+		// Create event for the top-level directory; individual Create events are
+		// NOT fired for the files that already existed inside it, so we must
+		// scan them explicitly here.
+		if ev.Has(fsnotify.Create) || ev.Has(fsnotify.Rename) {
+			_ = filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
+				if err != nil {
+					w.log(fmt.Sprintf("[watcher] walk error in %s: %v", p, err))
+					return nil
+				}
+				if d.IsDir() {
+					if addErr := w.fsw.Add(p); addErr != nil {
+						w.log(fmt.Sprintf("[watcher] cannot watch %s: %v", p, addErr))
+					}
+					return nil
+				}
+				if !d.Type().IsRegular() || w.shouldSkip(p) {
+					return nil
+				}
+				w.mu.Lock()
+				// Backdate so the file is eligible on the very next tick.
+				w.pending[p] = time.Now().Add(-debounceInterval)
+				w.mu.Unlock()
+				return nil
+			})
 		}
 		return
 	}
