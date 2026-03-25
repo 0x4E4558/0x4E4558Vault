@@ -1,3 +1,5 @@
+//go:build !android && !ios
+
 // Package watcher monitors a drop directory and automatically encrypts any
 // regular file that lands in it into the vault, then securely wipes the
 // plaintext from disk.
