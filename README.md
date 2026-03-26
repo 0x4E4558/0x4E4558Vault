@@ -67,7 +67,7 @@ xcode-select --install
 
 git clone https://github.com/0x4E4558/0x4E4558Vault.git && cd 0x4E4558Vault
 go build -o nexvault .
-open nexvault        # → app launches with a Dock icon
+./nexvault        # → runs from the terminal (see Installation below for the dock icon)
 ```
 
 ### Windows 10 / 11
@@ -96,6 +96,185 @@ go build -o nexvault .
 
 ```bash
 go test ./...
+```
+
+---
+
+## Installation
+
+`go build` produces a raw binary — fine for development, but not for everyday
+use. For a properly installed application with:
+
+- a working **Dock / taskbar icon**
+- an entry in **Spotlight / the Applications launcher**
+- **no spurious terminal window** on double-click
+
+use the `fyne` packaging tool, which creates a native app bundle and installs it
+in the correct system location.
+
+### 1. Install the fyne CLI (all platforms, once)
+
+```bash
+go install fyne.io/fyne/v2/cmd/fyne@latest
+```
+
+### 2. Package and install
+
+Run the following from the root of the cloned repository (where `FyneApp.toml`
+lives). `fyne install` reads the app name, ID, icon, and version from that file
+automatically.
+
+#### macOS
+
+```bash
+fyne install
+```
+
+This creates `nexvault.app` in `/Applications` with a correct `Info.plist` and
+embedded icon. Launch it from Spotlight or Finder — it appears in the Dock with
+the vault icon and **never opens a Terminal window**.
+
+#### Windows
+
+```powershell
+fyne install
+```
+
+Embeds the icon as a Windows resource, suppresses the console window
+automatically, and creates a Start Menu entry.
+
+#### Linux
+
+```bash
+fyne install
+```
+
+Installs the binary to `/usr/local/bin`, a `.desktop` file to
+`/usr/share/applications`, and the icon to the correct XDG icon directory, so
+`nexvault` appears in your application launcher with its icon.
+
+---
+
+## Starting the watcher automatically
+
+The GUI keeps the watcher running in the background as long as the app is open:
+close the window and the system-tray icon remains — the watcher keeps going.
+To start `nexvault` automatically at login, choose one of the methods below.
+
+### Auto-start the GUI (recommended for most users)
+
+The graphical app handles unlocking interactively, then watches the drop folder
+through its system-tray icon. No password file is needed.
+
+| Platform | Steps |
+|---|---|
+| **macOS** | System Settings → General → Login Items → **+** → select `nexvault.app` |
+| **Windows** | Press Win+R, type `shell:startup`, place a shortcut to `nexvault.exe` in the folder that opens |
+| **Linux (GNOME / KDE)** | Copy the installed `.desktop` file to `~/.config/autostart/` |
+
+```bash
+# Linux: one-liner to enable autostart
+cp /usr/share/applications/nexvault.desktop ~/.config/autostart/
+```
+
+### Headless watcher service (advanced)
+
+For a fully background daemon that uses the CLI `watch` sub-command without a
+GUI, follow the platform steps below.
+
+> ⚠️ **Security note:** the `watch` sub-command reads the vault password from
+> stdin when stdin is not a terminal. Storing a password in a plain file is a
+> security trade-off — use `chmod 600` and keep the file on an encrypted volume.
+
+#### macOS — launchd user agent
+
+Create `~/Library/LaunchAgents/io.nexvault.watcher.plist`, substituting
+`VAULT_PATH` and `DROP_PATH` with absolute paths:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.nexvault.watcher</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/nexvault.app/Contents/MacOS/nexvault</string>
+        <string>watch</string>
+        <string>-vault</string>
+        <string>VAULT_PATH</string>
+        <string>-drop</string>
+        <string>DROP_PATH</string>
+    </array>
+    <key>StandardInputPath</key>
+    <string>/Users/YOUR_USERNAME/.nexvault-pass</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/nexvault-watcher.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/nexvault-watcher.log</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>
+```
+
+```bash
+# Store the password (one-time setup)
+printf 'yourpassword\n' > ~/.nexvault-pass && chmod 600 ~/.nexvault-pass
+
+# Load the agent
+launchctl load ~/Library/LaunchAgents/io.nexvault.watcher.plist
+```
+
+#### Linux — systemd user service
+
+Create `~/.config/systemd/user/nexvault-watcher.service`, substituting
+`VAULT_PATH` and `DROP_PATH`:
+
+```ini
+[Unit]
+Description=nexvault drop-folder watcher
+
+[Service]
+ExecStart=/usr/local/bin/nexvault watch -vault VAULT_PATH -drop DROP_PATH
+StandardInput=file:%h/.nexvault-pass
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+# Store the password (one-time setup)
+printf 'yourpassword\n' > ~/.nexvault-pass && chmod 600 ~/.nexvault-pass
+
+# Enable and start
+systemctl --user enable --now nexvault-watcher.service
+```
+
+#### Windows — Task Scheduler
+
+```powershell
+# Store the password (one-time setup)
+"yourpassword" | Out-File -Encoding ascii "$env:USERPROFILE\.nexvault-pass"
+icacls "$env:USERPROFILE\.nexvault-pass" /inheritance:r /grant:r "${env:USERNAME}:(R)"
+
+# Wrapper script that pipes the password and runs the watcher
+$wrapper = @"
+Get-Content `"$env:USERPROFILE\.nexvault-pass`" | & `"$env:LOCALAPPDATA\nexvault\nexvault.exe`" watch -vault VAULT_PATH -drop DROP_PATH
+"@
+$wrapper | Out-File -Encoding utf8 "$env:USERPROFILE\.nexvault-watcher.ps1"
+
+# Register the scheduled task
+$action  = New-ScheduledTaskAction -Execute "powershell.exe" `
+               -Argument "-WindowStyle Hidden -File `"$env:USERPROFILE\.nexvault-watcher.ps1`""
+$trigger = New-ScheduledTaskTrigger -AtLogOn
+Register-ScheduledTask -TaskName "nexvault-watcher" `
+    -Action $action -Trigger $trigger -RunLevel Limited -Force
 ```
 
 ---
